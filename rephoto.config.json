@@ -1,0 +1,43 @@
+{
+  "manage_storage_url": "https://photos.google.com/quotamanagement",
+  "login_url": "https://accounts.google.com/",
+  "categories": [
+    "Large photos and videos",
+    "Blurry photos",
+    "Screenshots"
+  ],
+  "batch_size": 50,
+  "headless": false,
+  "locale": "it-IT",
+  "browser_timeout_ms": 30000,
+  "download_wait_seconds": 600,
+  "browser_channel": null,
+  "browser_executable_path": null,
+  "chrome_profile_dir": "state/chrome-profile",
+  "download_root": "data/downloads",
+  "extract_root": "data/extracted",
+  "logs_root": "state/logs",
+  "manifest_db": "state/manifest.sqlite3",
+  "delete_without_prompt": true,
+  "media_checkbox_selector": "main div[role='checkbox'][aria-checked='false']",
+  "selected_checkbox_selector": "main div[role='checkbox'][aria-checked='true']",
+  "download_button_names": [
+    "Download",
+    "Scarica"
+  ],
+  "delete_button_names": [
+    "Move to trash",
+    "Delete",
+    "Trash",
+    "Sposta nel cestino",
+    "Elimina"
+  ],
+  "confirm_delete_button_names": [
+    "Move to trash",
+    "Delete",
+    "Sposta nel cestino",
+    "Elimina"
+  ],
+  "adb_destination": "/sdcard/DCIM/Rephoto",
+  "adb_serial": null
+}

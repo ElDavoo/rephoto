@@ -50,6 +50,7 @@ class RunSummary:
     pushed_files: int = 0
     failed_batches: int = 0
     failure_artifacts: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,19 +143,61 @@ class RephotoPipeline:
 
         with PhotosBrowserSession(self.config) as browser:
             for category in self.config.categories:
-                browser.open_category(category)
+                print(f"[INFO] Scanning category: {category}")
+                try:
+                    browser.open_category(category)
+                except Exception as exc:
+                    message = str(exc)
+                    lower_message = message.lower()
+                    if "not authenticated" in lower_message or "rejected sign-in" in lower_message:
+                        note = (
+                            "Google Photos authentication failed before category processing: "
+                            f"{message}"
+                        )
+                        summary.notes.append(note)
+                        print(f"[WARN] {note}")
+                        return summary
+
+                    note = (
+                        f"Category '{category}' could not be opened: {message}. "
+                        "Check category text and language in configuration."
+                    )
+                    summary.notes.append(note)
+                    print(f"[WARN] {note}")
+                    continue
+
+                category_had_selection = False
 
                 while True:
                     if max_batches > 0 and summary.processed_batches >= max_batches:
+                        if summary.processed_batches == 0:
+                            note = (
+                                "Dry-run finished without selecting any items. "
+                                "Verify category labels, selector settings, and Google login state."
+                            )
+                            summary.notes.append(note)
+                            print(f"[WARN] {note}")
                         return summary
 
                     selection = browser.select_next_batch(self.config.batch_size)
                     if selection is None:
+                        if not category_had_selection:
+                            note = (
+                                f"No selectable media found in category '{category}'. "
+                                "This can happen if the category is empty or selectors need adjustment."
+                            )
+                            summary.notes.append(note)
+                            print(f"[INFO] {note}")
                         break
 
+                    category_had_selection = True
                     summary.processed_batches += 1
                     if mode == RunMode.DRY_RUN:
                         summary.dry_run_batches += 1
+                        print(
+                            "[DRY-RUN] Selected batch "
+                            f"{selection.remote_batch_id} with {selection.selected_count} item(s)."
+                        )
                         browser.clear_selection()
                         continue
 
@@ -189,6 +232,10 @@ class RephotoPipeline:
                         summary.downloaded_batches += 1
                         summary.downloaded_files += len(files)
                         summary.downloaded_bytes += total_bytes
+                        print(
+                            "[INFO] Downloaded and verified batch "
+                            f"{selection.remote_batch_id} ({len(files)} files, {total_bytes} bytes)."
+                        )
 
                         if mode in (RunMode.DOWNLOAD_DELETE, RunMode.DOWNLOAD_DELETE_PUSH):
                             if not deletion_approved:
@@ -202,6 +249,7 @@ class RephotoPipeline:
                             browser.trash_selected()
                             self.store.update_status(batch_id, BATCH_TRASHED)
                             summary.trashed_batches += 1
+                            print(f"[INFO] Trashed remote batch {selection.remote_batch_id}.")
 
                         browser.clear_selection()
 
@@ -211,10 +259,16 @@ class RephotoPipeline:
                             summary.pushed_files += int(push_result["pushed_files"])
                             if int(push_result["failed_files"]) > 0:
                                 summary.failed_batches += 1
+                            print(
+                                "[INFO] ADB push result for batch "
+                                f"{selection.remote_batch_id}: {push_result['pushed_files']} pushed, "
+                                f"{push_result['failed_files']} failed."
+                            )
 
                     except Exception as exc:
                         self.store.update_status(batch_id, BATCH_FAILED, error=str(exc))
                         summary.failed_batches += 1
+                        print(f"[ERROR] Batch {selection.remote_batch_id} failed: {exc}")
                         try:
                             artifact_path = browser.capture_failure_artifact(
                                 f"batch-{selection.remote_batch_id}"
@@ -226,6 +280,14 @@ class RephotoPipeline:
                             browser.clear_selection()
                         except Exception:
                             pass
+
+        if mode == RunMode.DRY_RUN and summary.processed_batches == 0:
+            note = (
+                "Dry-run finished without selecting any items. "
+                "Verify category labels, selector settings, and Google login state."
+            )
+            summary.notes.append(note)
+            print(f"[WARN] {note}")
 
         return summary
 

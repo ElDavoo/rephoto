@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import re
+import shutil
+import subprocess
 from typing import Any
 from uuid import uuid4
 
@@ -20,12 +22,63 @@ class SelectionResult:
     selected_count: int
 
 
+_BROWSER_PATH_CANDIDATES = (
+    "chromium",
+    "google-chrome-stable",
+    "google-chrome",
+    "chrome",
+)
+
+
+def discover_browser_executable() -> str | None:
+    for candidate in _BROWSER_PATH_CANDIDATES:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def resolve_browser_executable(config: RephotoConfig) -> str | None:
+    if config.browser_executable_path:
+        return config.browser_executable_path
+    return discover_browser_executable()
+
+
+def launch_manual_login_browser(
+    config: RephotoConfig,
+    *,
+    target_url: str = "https://accounts.google.com/",
+) -> subprocess.Popen[Any]:
+    executable = resolve_browser_executable(config)
+    if executable is None:
+        raise BrowserAutomationError(
+            "No Chrome/Chromium executable is available. "
+            "Use 'nix-shell -p chromium --run ...' or set browser_executable_path in config."
+        )
+
+    config.ensure_directories()
+    command = [
+        executable,
+        f"--user-data-dir={config.chrome_profile_dir.resolve()}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        target_url,
+    ]
+    try:
+        return subprocess.Popen(command)
+    except OSError as exc:
+        raise BrowserAutomationError(
+            f"Failed to launch browser executable '{executable}': {exc}"
+        ) from exc
+
+
 class PhotosBrowserSession:
     def __init__(self, config: RephotoConfig) -> None:
         self.config = config
         self._playwright_context: Any = None
         self._context: Any = None
         self._page: Any = None
+        self._resolved_browser_executable: str | None = None
 
     def __enter__(self) -> "PhotosBrowserSession":
         try:
@@ -37,13 +90,52 @@ class PhotosBrowserSession:
 
         self.config.ensure_directories()
         self._playwright_context = sync_playwright().start()
-        self._context = self._playwright_context.chromium.launch_persistent_context(
-            user_data_dir=str(self.config.chrome_profile_dir),
-            headless=self.config.headless,
-            downloads_path=str(self.config.download_root),
-            accept_downloads=True,
-            args=["--disable-dev-shm-usage"],
-        )
+        launch_options: dict[str, Any] = {
+            "user_data_dir": str(self.config.chrome_profile_dir),
+            "headless": self.config.headless,
+            "downloads_path": str(self.config.download_root),
+            "accept_downloads": True,
+            "locale": self.config.locale,
+        }
+        self._resolved_browser_executable = None
+        resolved_browser = resolve_browser_executable(self.config)
+        if self.config.browser_executable_path:
+            launch_options["executable_path"] = self.config.browser_executable_path
+            self._resolved_browser_executable = self.config.browser_executable_path
+        elif self.config.browser_channel:
+            launch_options["channel"] = self.config.browser_channel
+        elif resolved_browser:
+            launch_options["executable_path"] = resolved_browser
+            self._resolved_browser_executable = resolved_browser
+
+        try:
+            self._context = self._playwright_context.chromium.launch_persistent_context(
+                **launch_options,
+            )
+        except Exception as exc:
+            if self._playwright_context is not None:
+                self._playwright_context.stop()
+                self._playwright_context = None
+
+            launch_hint = ""
+            if self.config.browser_executable_path:
+                launch_hint = (
+                    f"browser_executable_path='{self.config.browser_executable_path}' could not be launched. "
+                )
+            elif self.config.browser_channel:
+                launch_hint = (
+                    f"browser_channel='{self.config.browser_channel}' is unavailable. "
+                )
+            elif self._resolved_browser_executable:
+                launch_hint = (
+                    f"Auto-discovered browser executable '{self._resolved_browser_executable}' could not be launched. "
+                )
+
+            raise BrowserAutomationError(
+                "Unable to launch browser context. "
+                + launch_hint
+                + "Set browser_executable_path to a locally installed Chrome/Chromium binary."
+            ) from exc
 
         if self._context.pages:
             self._page = self._context.pages[0]
@@ -63,22 +155,85 @@ class PhotosBrowserSession:
 
     @property
     def page(self) -> Any:
+        if self._context is None:
+            raise BrowserAutomationError("Browser context is not active")
+
+        if self._page is None or self._page.is_closed():
+            self._page = self._context.new_page()
+            self._page.set_default_timeout(self.config.browser_timeout_ms)
+
         if self._page is None:
             raise BrowserAutomationError("Browser session is not active")
         return self._page
 
     def open_manage_storage(self) -> None:
-        self.page.goto(self.config.manage_storage_url)
-        self.page.wait_for_load_state("networkidle")
+        self.open_login_page()
+        auth_error = self._authentication_error()
+        if auth_error:
+            raise BrowserAutomationError(auth_error)
+
+    def open_login_page(self) -> None:
+        self.page.goto(self.config.manage_storage_url, wait_until="domcontentloaded")
+        self.page.wait_for_timeout(400)
+
+    def authentication_error(self) -> str | None:
+        return self._authentication_error()
+
+    def is_authenticated(self) -> bool:
+        return self._authentication_error() is None
+
+    def _authentication_error(self) -> str | None:
+        current_url = self.page.url.lower()
+        if "accounts.google.com" not in current_url:
+            return None
+
+        body_text = ""
+        try:
+            body_text = self.page.inner_text("body").lower()
+        except Exception:
+            body_text = ""
+
+        if "may not be secure" in body_text or "not safe" in body_text:
+            return (
+                "Google rejected sign-in for this browser context ('not safe'). "
+                "Use a normal Chrome/Chromium binary by setting browser_executable_path in config, "
+                "or run through 'nix-shell -p chromium' so Chromium is available in PATH, "
+                "then log in once in that profile and rerun."
+            )
+
+        if (
+            "non puoi accedere da questo dispositivo" in body_text
+            or "browser o app potrebbe non essere sicura" in body_text
+            or "non è possibile accedere da questo dispositivo" in body_text
+        ):
+            return (
+                "Google ha bloccato l'accesso per questo contesto browser. "
+                "Apri una sessione di login manuale con un Chromium reale (per esempio via "
+                "'nix-shell -p chromium --run ...'), completa il login e poi riesegui il comando."
+            )
+
+        return (
+            "Google Photos is not authenticated in the configured browser profile. "
+            "Log in manually in the opened browser and rerun dry-run."
+        )
+
+    def save_storage_state(self, output_path: Path) -> Path:
+        if self._context is None:
+            raise BrowserAutomationError("Browser context is not active")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._context.storage_state(path=str(output_path))
+        return output_path
 
     def open_category(self, category_name: str) -> None:
         self.open_manage_storage()
         target = self.page.get_by_text(category_name, exact=False).first
         try:
-            target.click()
+            target.click(timeout=min(self.config.browser_timeout_ms, 8_000))
         except Exception as exc:
+            current_url = self.page.url
             raise BrowserAutomationError(
-                f"Unable to open category '{category_name}'. Update category text in config."
+                f"Unable to open category '{category_name}' from {current_url}. "
+                "Update category text for your language and confirm Google Photos is logged in."
             ) from exc
         self.page.wait_for_timeout(800)
 

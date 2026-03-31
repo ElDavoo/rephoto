@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 
+from rephoto.browser import resolve_browser_executable
 from rephoto.config import RephotoConfig
 
 
@@ -83,8 +84,38 @@ def run_preflight(config: RephotoConfig, *, require_adb: bool) -> PreflightRepor
     if config.batch_size <= 0:
         report.errors.append("batch_size must be greater than zero")
 
+    if not config.locale:
+        report.errors.append("locale must not be empty")
+
+    if config.browser_channel and config.browser_executable_path:
+        report.warnings.append(
+            "Both browser_channel and browser_executable_path are set. "
+            "browser_executable_path takes precedence."
+        )
+
+    if config.browser_executable_path:
+        executable_path = Path(config.browser_executable_path)
+        if not executable_path.exists():
+            report.errors.append(
+                f"Configured browser_executable_path does not exist: {executable_path}"
+            )
+        elif not os.access(executable_path, os.X_OK):
+            report.errors.append(
+                f"Configured browser_executable_path is not executable: {executable_path}"
+            )
+    elif not config.browser_channel:
+        discovered_browser = resolve_browser_executable(config)
+        if discovered_browser is None:
+            report.warnings.append(
+                "No local Chrome/Chromium found in PATH. Google sign-in may reject Playwright bundled Chromium. "
+                "Run commands through 'nix-shell -p chromium --run ...' or set browser_executable_path."
+            )
+
     if not config.manage_storage_url.startswith("https://"):
         report.errors.append("manage_storage_url must be https")
+
+    if not config.login_url.startswith("https://"):
+        report.errors.append("login_url must be https")
 
     try:
         config.ensure_directories()

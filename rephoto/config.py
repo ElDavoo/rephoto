@@ -11,6 +11,7 @@ DEFAULT_CONFIG_PATH = Path("rephoto.config.json")
 @dataclass
 class RephotoConfig:
     manage_storage_url: str = "https://photos.google.com/quotamanagement"
+    login_url: str = "https://accounts.google.com/"
     categories: list[str] = field(
         default_factory=lambda: [
             "Large photos and videos",
@@ -20,8 +21,11 @@ class RephotoConfig:
     )
     batch_size: int = 50
     headless: bool = False
+    locale: str = "it-IT"
     browser_timeout_ms: int = 30_000
     download_wait_seconds: int = 600
+    browser_channel: str | None = None
+    browser_executable_path: str | None = None
 
     chrome_profile_dir: Path = Path("state/chrome-profile")
     download_root: Path = Path("data/downloads")
@@ -33,12 +37,12 @@ class RephotoConfig:
 
     media_checkbox_selector: str = "main div[role='checkbox'][aria-checked='false']"
     selected_checkbox_selector: str = "main div[role='checkbox'][aria-checked='true']"
-    download_button_names: list[str] = field(default_factory=lambda: ["Download"])
+    download_button_names: list[str] = field(default_factory=lambda: ["Download", "Scarica"])
     delete_button_names: list[str] = field(
-        default_factory=lambda: ["Move to trash", "Delete", "Trash"]
+        default_factory=lambda: ["Move to trash", "Delete", "Trash", "Sposta nel cestino", "Elimina"]
     )
     confirm_delete_button_names: list[str] = field(
-        default_factory=lambda: ["Move to trash", "Delete"]
+        default_factory=lambda: ["Move to trash", "Delete", "Sposta nel cestino", "Elimina"]
     )
 
     adb_destination: str = "/sdcard/DCIM/Rephoto"
@@ -57,11 +61,15 @@ class RephotoConfig:
     def to_json(self) -> dict[str, Any]:
         return {
             "manage_storage_url": self.manage_storage_url,
+            "login_url": self.login_url,
             "categories": self.categories,
             "batch_size": self.batch_size,
             "headless": self.headless,
+            "locale": self.locale,
             "browser_timeout_ms": self.browser_timeout_ms,
             "download_wait_seconds": self.download_wait_seconds,
+            "browser_channel": self.browser_channel,
+            "browser_executable_path": self.browser_executable_path,
             "chrome_profile_dir": str(self.chrome_profile_dir),
             "download_root": str(self.download_root),
             "extract_root": str(self.extract_root),
@@ -97,9 +105,15 @@ class RephotoConfig:
                 setattr(cfg, key, value)
 
         cfg.categories = [str(category) for category in cfg.categories]
+        cfg.locale = str(cfg.locale)
+        cfg.login_url = str(cfg.login_url)
         cfg.download_button_names = [str(name) for name in cfg.download_button_names]
         cfg.delete_button_names = [str(name) for name in cfg.delete_button_names]
         cfg.confirm_delete_button_names = [str(name) for name in cfg.confirm_delete_button_names]
+        if cfg.browser_channel is not None:
+            cfg.browser_channel = str(cfg.browser_channel)
+        if cfg.browser_executable_path is not None:
+            cfg.browser_executable_path = str(cfg.browser_executable_path)
         return cfg
 
 
