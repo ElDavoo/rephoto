@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 from rephoto.config import RephotoConfig
@@ -231,15 +232,73 @@ class PhotosBrowserSession:
             raise BrowserAutomationError("Browser session is not active")
         return self._page
 
+    def _language_hint(self) -> str:
+        normalized_locale = str(self.config.locale).strip().replace("_", "-")
+        if not normalized_locale:
+            return "en"
+
+        primary_language = normalized_locale.split("-", maxsplit=1)[0].lower()
+        return primary_language or "en"
+
+    def _url_with_language_hint(self, target_url: str) -> str:
+        parsed = urlsplit(str(target_url))
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query["hl"] = self._language_hint()
+        encoded_query = urlencode(query)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, encoded_query, parsed.fragment))
+
+    def open_account_login_page(self) -> None:
+        localized_login_url = self._url_with_language_hint(self.config.login_url)
+        self.page.goto(localized_login_url, wait_until="domcontentloaded")
+        self.page.wait_for_timeout(400)
+
     def _is_manage_storage_destination(self, url: str) -> bool:
-        expected = self.config.manage_storage_url.lower().rstrip("/")
-        current = url.lower().rstrip("/")
-        return (
-            current == expected
-            or current.startswith(expected + "?")
-            or current.startswith(expected + "#")
-            or current.startswith(expected + "/")
-        )
+        expected_url = self._url_with_language_hint(self.config.manage_storage_url)
+        expected = urlsplit(expected_url)
+        current = urlsplit(url)
+
+        if expected.netloc.lower() != current.netloc.lower():
+            return False
+
+        expected_path = expected.path.rstrip("/") or "/"
+        current_path = current.path.rstrip("/") or "/"
+        return current_path == expected_path or current_path.startswith(expected_path + "/")
+
+    def _category_name_variants(self, category_name: str) -> list[str]:
+        normalized = " ".join(category_name.split())
+        variants = [
+            normalized,
+            normalized.replace(" and ", " & "),
+            normalized.replace(" & ", " and "),
+            normalized.replace("&", "and"),
+        ]
+        unique_variants: list[str] = []
+        for variant in variants:
+            cleaned = " ".join(variant.split())
+            if cleaned and cleaned not in unique_variants:
+                unique_variants.append(cleaned)
+        return unique_variants
+
+    def _resolve_checkbox_locator(self, configured_selector: str, fallback_selector: str) -> Any:
+        locator = self.page.locator(configured_selector)
+        if locator.count() > 0:
+            return locator
+
+        fallback_selectors: list[str] = []
+        if configured_selector.startswith("main "):
+            fallback_selectors.append(configured_selector[len("main ") :])
+        fallback_selectors.append(fallback_selector)
+
+        seen: set[str] = set()
+        for selector in fallback_selectors:
+            if selector in seen:
+                continue
+            seen.add(selector)
+            candidate = self.page.locator(selector)
+            if candidate.count() > 0:
+                return candidate
+
+        return locator
 
     def open_manage_storage(self) -> None:
         self.open_login_page()
@@ -250,7 +309,7 @@ class PhotosBrowserSession:
         # Google can briefly redirect through accounts.google.com even for
         # already authenticated profiles; wait for the final destination.
         for _ in range(12):
-            current_url = self.page.url.lower()
+            current_url = self.page.url
             if self._is_manage_storage_destination(current_url):
                 return
 
@@ -267,7 +326,8 @@ class PhotosBrowserSession:
         )
 
     def open_login_page(self) -> None:
-        self.page.goto(self.config.manage_storage_url, wait_until="domcontentloaded")
+        localized_manage_storage_url = self._url_with_language_hint(self.config.manage_storage_url)
+        self.page.goto(localized_manage_storage_url, wait_until="domcontentloaded")
         self.page.wait_for_timeout(400)
 
     def authentication_error(self) -> str | None:
@@ -338,38 +398,60 @@ class PhotosBrowserSession:
 
     def open_category(self, category_name: str) -> None:
         self.open_manage_storage()
-        target = self.page.get_by_text(category_name, exact=False).first
-        try:
-            target.click(timeout=min(self.config.browser_timeout_ms, 8_000))
-        except Exception as exc:
-            current_url = self.page.url
-            raise BrowserAutomationError(
-                f"Unable to open category '{category_name}' from {current_url}. "
-                "Update category text for your language and confirm Google Photos is logged in."
-            ) from exc
-        self.page.wait_for_timeout(800)
+        timeout_ms = min(self.config.browser_timeout_ms, 8_000)
+        category_variants = self._category_name_variants(category_name)
+
+        for candidate_name in category_variants:
+            target = self.page.get_by_role("option", name=re.compile(re.escape(candidate_name), re.IGNORECASE)).first
+            try:
+                target.click(timeout=timeout_ms)
+                self.page.wait_for_timeout(800)
+                return
+            except Exception:
+                continue
+
+        for candidate_name in category_variants:
+            target = self.page.get_by_text(candidate_name, exact=False).first
+            try:
+                target.click(timeout=timeout_ms)
+                self.page.wait_for_timeout(800)
+                return
+            except Exception:
+                continue
+
+        current_url = self.page.url
+        raise BrowserAutomationError(
+            f"Unable to open category '{category_name}' from {current_url}. "
+            "Update category text for your language and confirm Google Photos is logged in."
+        )
 
     def select_next_batch(self, batch_size: int) -> SelectionResult | None:
         if batch_size <= 0:
             raise BrowserAutomationError("batch_size must be greater than zero")
 
-        checkboxes = self.page.locator(self.config.media_checkbox_selector)
+        checkboxes = self._resolve_checkbox_locator(
+            self.config.media_checkbox_selector,
+            "div[role='checkbox'][aria-checked='false']",
+        )
         available_count = checkboxes.count()
         if available_count == 0:
             return None
 
         selected_count = min(batch_size, available_count)
         for _ in range(selected_count):
-            checkboxes.first.click()
+            checkboxes.first.click(force=True)
 
         self.page.wait_for_timeout(250)
         return SelectionResult(remote_batch_id=str(uuid4()), selected_count=selected_count)
 
     def clear_selection(self) -> None:
-        selected = self.page.locator(self.config.selected_checkbox_selector)
+        selected = self._resolve_checkbox_locator(
+            self.config.selected_checkbox_selector,
+            "div[role='checkbox'][aria-checked='true']",
+        )
         selected_count = selected.count()
         for _ in range(selected_count):
-            selected.first.click()
+            selected.first.click(force=True)
         self.page.wait_for_timeout(200)
 
     def _click_button_by_name(self, names: list[str], *, timeout_ms: int = 1500) -> bool:

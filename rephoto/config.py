@@ -14,14 +14,14 @@ class RephotoConfig:
     login_url: str = "https://accounts.google.com/"
     categories: list[str] = field(
         default_factory=lambda: [
-            "Large photos and videos",
+            "Large photos & videos",
             "Blurry photos",
             "Screenshots",
         ]
     )
     batch_size: int = 50
     headless: bool = False
-    locale: str = "it-IT"
+    locale: str = "en-US"
     browser_timeout_ms: int = 30_000
     download_wait_seconds: int = 600
     browser_channel: str | None = None
@@ -35,8 +35,8 @@ class RephotoConfig:
 
     delete_without_prompt: bool = True
 
-    media_checkbox_selector: str = "main div[role='checkbox'][aria-checked='false']"
-    selected_checkbox_selector: str = "main div[role='checkbox'][aria-checked='true']"
+    media_checkbox_selector: str = "div[role='checkbox'][aria-checked='false']"
+    selected_checkbox_selector: str = "div[role='checkbox'][aria-checked='true']"
     download_button_names: list[str] = field(default_factory=lambda: ["Download", "Scarica"])
     delete_button_names: list[str] = field(
         default_factory=lambda: ["Move to trash", "Delete", "Trash", "Sposta nel cestino", "Elimina"]
@@ -105,7 +105,7 @@ class RephotoConfig:
                 setattr(cfg, key, value)
 
         cfg.categories = [str(category) for category in cfg.categories]
-        cfg.locale = str(cfg.locale)
+        cfg.locale = str(cfg.locale).replace("_", "-")
         cfg.login_url = str(cfg.login_url)
         cfg.download_button_names = [str(name) for name in cfg.download_button_names]
         cfg.delete_button_names = [str(name) for name in cfg.delete_button_names]

@@ -126,8 +126,7 @@ def main(argv: list[str] | None = None) -> int:
                 except BrowserAutomationError as exc:
                     print(f"[WARN] Initial auth check failed: {exc}")
 
-                browser.page.goto(config.login_url, wait_until="domcontentloaded")
-                browser.page.wait_for_timeout(400)
+                browser.open_account_login_page()
                 print("[INFO] Playwright browser session started with persistent profile.")
                 print("[INFO] Complete Google login in the opened browser window.")
 

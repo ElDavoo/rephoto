@@ -81,7 +81,7 @@ If Google shows "This browser or app may not be secure", configure a normal loca
 
 Main fields in `rephoto.config.json`:
 - `categories`: list of category display names as they appear in your Google Photos language.
-- `locale`: UI locale used by Playwright context (default `it-IT`).
+- `locale`: UI locale used by Playwright context (default `en-US`). Also used to set Google URL language hint (`hl=`), so `en-US` opens English pages.
 - `login_url`: URL used for manual login bootstrap (default `https://accounts.google.com/`).
 - `batch_size`: max selected items per batch.
 - `browser_executable_path`: absolute path to a normal local Chrome/Chromium binary.

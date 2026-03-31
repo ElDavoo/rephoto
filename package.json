@@ -1,0 +1,15 @@
+{
+  "name": "rephoto",
+  "version": "1.0.0",
+  "description": "Rephoto automates this workflow: 1. Select a category inside Google Photos storage management. 2. Download a batch locally and catalog file hashes. 3. Trash the same remote batch in Google Photos. 4. Push files to Android with ADB so phone backup can re-upload.",
+  "main": "index.js",
+  "scripts": {},
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@types/node": "^25.5.0"
+  }
+}
