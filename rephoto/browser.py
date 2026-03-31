@@ -37,6 +37,8 @@ _PLAYWRIGHT_CHROME_ARGS = (
     "--disable-web-security",
     "--disable-infobars",
     "--disable-extensions",
+    "--disable-translate",
+    "--disable-features=Translate,TranslateUI",
     "--start-maximized",
     "--window-size=1280,720",
 )
@@ -444,6 +446,22 @@ class PhotosBrowserSession:
         self.page.wait_for_timeout(250)
         return SelectionResult(remote_batch_id=str(uuid4()), selected_count=selected_count)
 
+    def select_single_candidate(self, index: int = 0) -> SelectionResult | None:
+        if index < 0:
+            raise BrowserAutomationError("index must be greater than or equal to zero")
+
+        checkboxes = self._resolve_checkbox_locator(
+            self.config.media_checkbox_selector,
+            "div[role='checkbox'][aria-checked='false']",
+        )
+        available_count = checkboxes.count()
+        if available_count == 0 or index >= available_count:
+            return None
+
+        checkboxes.nth(index).click(force=True)
+        self.page.wait_for_timeout(250)
+        return SelectionResult(remote_batch_id=str(uuid4()), selected_count=1)
+
     def clear_selection(self) -> None:
         selected = self._resolve_checkbox_locator(
             self.config.selected_checkbox_selector,
@@ -454,16 +472,73 @@ class PhotosBrowserSession:
             selected.first.click(force=True)
         self.page.wait_for_timeout(200)
 
-    def _click_button_by_name(self, names: list[str], *, timeout_ms: int = 1500) -> bool:
-        for name in names:
-            locator = self.page.get_by_role(
-                "button",
-                name=re.compile(re.escape(name), re.IGNORECASE),
-            ).first
+    def _candidate_matches_name_patterns(
+        self,
+        candidate: Any,
+        name_patterns: list[re.Pattern[str]],
+        *,
+        timeout_ms: int,
+    ) -> bool:
+        try:
+            if not candidate.is_visible(timeout=timeout_ms):
+                return False
+        except Exception:
+            return False
+
+        text_chunks: list[str] = []
+        for attribute in ("aria-label", "title"):
             try:
-                if locator.is_visible(timeout=timeout_ms):
-                    locator.click()
-                    return True
+                value = candidate.get_attribute(attribute, timeout=timeout_ms) or ""
+            except Exception:
+                value = ""
+            if value:
+                text_chunks.append(value)
+
+        try:
+            inner_text = candidate.inner_text(timeout=timeout_ms) or ""
+        except Exception:
+            inner_text = ""
+        if inner_text:
+            text_chunks.append(inner_text)
+
+        searchable = " ".join(text_chunks)
+        if not searchable:
+            return False
+        return any(pattern.search(searchable) for pattern in name_patterns)
+
+    def _has_button_by_name(self, names: list[str], *, timeout_ms: int = 1500) -> bool:
+        name_patterns = [re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE) for name in names]
+        candidates = self.page.locator("button, [role='button']")
+        candidate_count = candidates.count()
+        for index in range(candidate_count):
+            if self._candidate_matches_name_patterns(
+                candidates.nth(index),
+                name_patterns,
+                timeout_ms=timeout_ms,
+            ):
+                return True
+        return False
+
+    def has_download_action(self, *, timeout_ms: int = 1500) -> bool:
+        return self._has_button_by_name(self.config.download_button_names, timeout_ms=timeout_ms)
+
+    def _click_button_by_name(self, names: list[str], *, timeout_ms: int = 1500) -> bool:
+        name_patterns = [re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE) for name in names]
+        candidates = self.page.locator("button, [role='button']")
+        candidate_count = candidates.count()
+
+        for index in range(candidate_count):
+            candidate = candidates.nth(index)
+            if not self._candidate_matches_name_patterns(
+                candidate,
+                name_patterns,
+                timeout_ms=timeout_ms,
+            ):
+                continue
+
+            try:
+                candidate.click(timeout=timeout_ms)
+                return True
             except Exception:
                 continue
         return False

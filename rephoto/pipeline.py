@@ -80,6 +80,7 @@ def _safe_extract_target(base_dir: Path, member_name: str) -> Path:
 
 def extract_and_catalog(archive_path: Path, extract_dir: Path) -> tuple[list[CatalogEntry], int]:
     extract_dir.mkdir(parents=True, exist_ok=True)
+    extract_root = extract_dir.resolve()
 
     entries: list[CatalogEntry] = []
     total_bytes = 0
@@ -96,7 +97,7 @@ def extract_and_catalog(archive_path: Path, extract_dir: Path) -> tuple[list[Cat
                 with archive.open(member, "r") as source, target.open("wb") as destination:
                     shutil.copyfileobj(source, destination)
 
-                relative_path = target.relative_to(extract_dir).as_posix()
+                relative_path = target.relative_to(extract_root).as_posix()
                 size_bytes = target.stat().st_size
                 entries.append(
                     CatalogEntry(
@@ -109,12 +110,13 @@ def extract_and_catalog(archive_path: Path, extract_dir: Path) -> tuple[list[Cat
 
         return entries, total_bytes
 
-    target = extract_dir / archive_path.name
+    target = (extract_dir / archive_path.name).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(archive_path, target)
     size_bytes = target.stat().st_size
     entries.append(
         CatalogEntry(
-            relative_path=target.relative_to(extract_dir).as_posix(),
+            relative_path=target.relative_to(extract_root).as_posix(),
             sha256=_sha256_file(target),
             size_bytes=size_bytes,
         )
@@ -200,6 +202,43 @@ class RephotoPipeline:
                         )
                         browser.clear_selection()
                         continue
+
+                    if not browser.has_download_action(timeout_ms=1200):
+                        if selection.selected_count > 1:
+                            print(
+                                "[INFO] Download action is unavailable for current bulk selection; "
+                                "retrying with a single item."
+                            )
+                            browser.clear_selection()
+                            fallback_selection = None
+                            for candidate_index in range(25):
+                                candidate_selection = browser.select_single_candidate(candidate_index)
+                                if candidate_selection is None:
+                                    break
+
+                                if browser.has_download_action(timeout_ms=1200):
+                                    fallback_selection = candidate_selection
+                                    break
+
+                                browser.clear_selection()
+
+                            if fallback_selection is None:
+                                note = (
+                                    f"Unable to find a downloadable item in category '{category}'. "
+                                    "Selection was cleared before download."
+                                )
+                                summary.processed_batches = max(0, summary.processed_batches - 1)
+                                summary.notes.append(note)
+                                print(f"[WARN] {note}")
+                                break
+
+                            selection = fallback_selection
+
+                        if not browser.has_download_action(timeout_ms=1200):
+                            raise RuntimeError(
+                                "Download action is unavailable for the selected items. "
+                                "Try reducing batch_size or adjust selection selectors."
+                            )
 
                     batch_id = self.store.ensure_batch(
                         selection.remote_batch_id,
