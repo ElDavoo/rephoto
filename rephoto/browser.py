@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import os
 from pathlib import Path
 import re
 import shutil
@@ -28,6 +29,38 @@ _BROWSER_PATH_CANDIDATES = (
     "google-chrome",
     "chrome",
 )
+
+_PLAYWRIGHT_CHROME_ARGS = (
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-web-security",
+    "--disable-infobars",
+    "--disable-extensions",
+    "--start-maximized",
+    "--window-size=1280,720",
+)
+
+_WAYLAND_GPU_SAFE_ARGS = (
+    "--ozone-platform=wayland",
+    "--enable-features=UseOzonePlatform",
+    "--disable-gpu",
+    "--disable-gpu-compositing",
+    "--disable-accelerated-2d-canvas",
+    "--disable-accelerated-video-decode",
+    "--disable-features=VaapiVideoDecoder",
+)
+
+_PLAYWRIGHT_DESKTOP_CHROME_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
+
+
+def _browser_process_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("NIXOS_OZONE_WL", "1")
+    env.setdefault("OZONE_PLATFORM", "wayland")
+    return env
 
 
 def discover_browser_executable() -> str | None:
@@ -62,10 +95,11 @@ def launch_manual_login_browser(
         f"--user-data-dir={config.chrome_profile_dir.resolve()}",
         "--no-first-run",
         "--no-default-browser-check",
+        *_WAYLAND_GPU_SAFE_ARGS,
         target_url,
     ]
     try:
-        return subprocess.Popen(command)
+        return subprocess.Popen(command, env=_browser_process_env())
     except OSError as exc:
         raise BrowserAutomationError(
             f"Failed to launch browser executable '{executable}': {exc}"
@@ -90,13 +124,24 @@ class PhotosBrowserSession:
 
         self.config.ensure_directories()
         self._playwright_context = sync_playwright().start()
+        desktop_chrome = self._playwright_context.devices.get("Desktop Chrome", {})
+        desktop_chrome_user_agent = desktop_chrome.get(
+            "user_agent",
+            _PLAYWRIGHT_DESKTOP_CHROME_USER_AGENT,
+        )
         launch_options: dict[str, Any] = {
             "user_data_dir": str(self.config.chrome_profile_dir),
             "headless": self.config.headless,
+            "args": [*_PLAYWRIGHT_CHROME_ARGS, *_WAYLAND_GPU_SAFE_ARGS],
             "downloads_path": str(self.config.download_root),
             "accept_downloads": True,
+            "env": _browser_process_env(),
+            "user_agent": desktop_chrome_user_agent,
             "locale": self.config.locale,
+            "viewport": {"width": 1280, "height": 720},
+            "device_scale_factor": 1,
         }
+        used_auto_discovered_executable = False
         self._resolved_browser_executable = None
         resolved_browser = resolve_browser_executable(self.config)
         if self.config.browser_executable_path:
@@ -106,13 +151,27 @@ class PhotosBrowserSession:
             launch_options["channel"] = self.config.browser_channel
         elif resolved_browser:
             launch_options["executable_path"] = resolved_browser
+            used_auto_discovered_executable = True
             self._resolved_browser_executable = resolved_browser
 
+        launch_errors: list[str] = []
         try:
             self._context = self._playwright_context.chromium.launch_persistent_context(
                 **launch_options,
             )
         except Exception as exc:
+            launch_errors.append(str(exc))
+            if used_auto_discovered_executable and launch_options.get("executable_path"):
+                launch_options.pop("executable_path", None)
+                self._resolved_browser_executable = None
+                try:
+                    self._context = self._playwright_context.chromium.launch_persistent_context(
+                        **launch_options,
+                    )
+                except Exception as retry_exc:
+                    launch_errors.append(str(retry_exc))
+
+        if self._context is None:
             if self._playwright_context is not None:
                 self._playwright_context.stop()
                 self._playwright_context = None
@@ -131,11 +190,17 @@ class PhotosBrowserSession:
                     f"Auto-discovered browser executable '{self._resolved_browser_executable}' could not be launched. "
                 )
 
+            details = ""
+            if launch_errors:
+                unique_errors = [entry for entry in dict.fromkeys(launch_errors) if entry]
+                details = " Playwright error: " + " | ".join(unique_errors)
+
             raise BrowserAutomationError(
                 "Unable to launch browser context. "
                 + launch_hint
                 + "Set browser_executable_path to a locally installed Chrome/Chromium binary."
-            ) from exc
+                + details
+            )
 
         if self._context.pages:
             self._page = self._context.pages[0]
@@ -166,11 +231,40 @@ class PhotosBrowserSession:
             raise BrowserAutomationError("Browser session is not active")
         return self._page
 
+    def _is_manage_storage_destination(self, url: str) -> bool:
+        expected = self.config.manage_storage_url.lower().rstrip("/")
+        current = url.lower().rstrip("/")
+        return (
+            current == expected
+            or current.startswith(expected + "?")
+            or current.startswith(expected + "#")
+            or current.startswith(expected + "/")
+        )
+
     def open_manage_storage(self) -> None:
         self.open_login_page()
-        auth_error = self._authentication_error()
-        if auth_error:
-            raise BrowserAutomationError(auth_error)
+
+        if self._is_manage_storage_destination(self.page.url):
+            return
+
+        # Google can briefly redirect through accounts.google.com even for
+        # already authenticated profiles; wait for the final destination.
+        for _ in range(12):
+            current_url = self.page.url.lower()
+            if self._is_manage_storage_destination(current_url):
+                return
+
+            auth_error = self._authentication_error()
+            if auth_error:
+                raise BrowserAutomationError(auth_error)
+
+            self.page.wait_for_timeout(500)
+
+        current_url = self.page.url
+        raise BrowserAutomationError(
+            "Unable to reach Google Photos manage storage page. "
+            f"Current URL: {current_url}"
+        )
 
     def open_login_page(self) -> None:
         self.page.goto(self.config.manage_storage_url, wait_until="domcontentloaded")
@@ -212,10 +306,28 @@ class PhotosBrowserSession:
                 "'nix-shell -p chromium --run ...'), completa il login e poi riesegui il comando."
             )
 
-        return (
-            "Google Photos is not authenticated in the configured browser profile. "
-            "Log in manually in the opened browser and rerun dry-run."
+        sign_in_markers = (
+            "sign in",
+            "accedi",
+            "scegli un account",
+            "choose an account",
+            "use your google account",
+            "utilizza il tuo account google",
         )
+        if any(marker in body_text for marker in sign_in_markers):
+            return (
+                "Google Photos is not authenticated in the configured browser profile. "
+                "Log in manually in the opened browser and rerun dry-run."
+            )
+
+        if "servicelogin" in current_url or "identifier" in current_url:
+            return (
+                "Google Photos is not authenticated in the configured browser profile. "
+                "Log in manually in the opened browser and rerun dry-run."
+            )
+
+        # Unknown accounts.google.com intermediate page, likely part of redirect chain.
+        return None
 
     def save_storage_state(self, output_path: Path) -> Path:
         if self._context is None:

@@ -2,7 +2,7 @@
   description = "Rephoto: download Google Photos storage items and re-upload via phone";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -16,6 +16,7 @@
         ]);
 
         runtimeTools = with pkgs; [
+          chromium
           android-tools
           exiftool
           gnutar
@@ -31,6 +32,8 @@
             export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
             export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
             export PLAYWRIGHT_NODEJS_PATH="${pkgs.nodejs}/bin/node"
+            export NIXOS_OZONE_WL=1
+            export OZONE_PLATFORM=wayland
             export PYTHONPATH="${toString ./.}:''${PYTHONPATH:-}"
             exec ${pythonEnv}/bin/python -m rephoto.cli "$@"
           '';
@@ -50,6 +53,8 @@
             export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
             export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
             export PLAYWRIGHT_NODEJS_PATH="${pkgs.nodejs}/bin/node"
+            export NIXOS_OZONE_WL=1
+            export OZONE_PLATFORM=wayland
             export PYTHONPATH="${toString ./.}:''${PYTHONPATH:-}"
           '';
         };

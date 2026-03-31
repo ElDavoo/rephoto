@@ -3,13 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import subprocess
 import sys
 
 from rephoto.browser import (
     BrowserAutomationError,
     PhotosBrowserSession,
-    launch_manual_login_browser,
 )
 from rephoto.config import DEFAULT_CONFIG_PATH, load_config, write_default_config
 from rephoto.pipeline import RephotoPipeline, RunMode
@@ -114,10 +112,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "login":
-        manual_browser = None
         try:
-            try:
-                with PhotosBrowserSession(config) as browser:
+            with PhotosBrowserSession(config) as browser:
+                try:
                     browser.open_manage_storage()
                     if browser.is_authenticated():
                         print("[OK] Google Photos is already authenticated in this profile.")
@@ -126,29 +123,22 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         print(f"[OK] Session state saved: {storage_state_path}")
                         return 0
-            except BrowserAutomationError as exc:
-                print(f"[WARN] Initial auth check failed: {exc}")
+                except BrowserAutomationError as exc:
+                    print(f"[WARN] Initial auth check failed: {exc}")
 
-            manual_browser = launch_manual_login_browser(
-                config,
-                target_url=config.login_url,
-            )
-            print("[INFO] Manual browser session started with persistent profile.")
-            print("[INFO] Complete Google login in the opened browser window.")
+                browser.page.goto(config.login_url, wait_until="domcontentloaded")
+                browser.page.wait_for_timeout(400)
+                print("[INFO] Playwright browser session started with persistent profile.")
+                print("[INFO] Complete Google login in the opened browser window.")
 
-            input(
-                "After login completes, close the manual browser window and press Enter to verify session..."
-            )
+                input(
+                    "After login completes, press Enter to verify session..."
+                )
 
-            if manual_browser is not None and manual_browser.poll() is None:
-                manual_browser.terminate()
-                try:
-                    manual_browser.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    manual_browser.kill()
-
-            with PhotosBrowserSession(config) as browser:
                 browser.open_manage_storage()
+                auth_error = browser.authentication_error()
+                if auth_error:
+                    raise BrowserAutomationError(auth_error)
                 storage_state_path = browser.save_storage_state(
                     config.logs_root / "storage-state.json"
                 )
@@ -169,13 +159,6 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             print("\n[WARN] Login flow interrupted by user.", file=sys.stderr)
             return 130
-        finally:
-            if manual_browser is not None and manual_browser.poll() is None:
-                manual_browser.terminate()
-                try:
-                    manual_browser.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    manual_browser.kill()
 
     pipeline = RephotoPipeline(config)
     try:
