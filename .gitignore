@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.direnv/
+.venv/
+result
+state/
+data/downloads/
+data/extracted/
