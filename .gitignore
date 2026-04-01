@@ -1,16 +1,2 @@
-__pycache__/
-*.py[cod]
-.direnv/
-.venv/
-result
-state/
-data/downloads/
-data/extracted/
-
-# Playwright
-node_modules/
-/test-results/
-/playwright-report/
-/blob-report/
-/playwright/.cache/
-/playwright/.auth/
+# Created by venv; see https://docs.python.org/3/library/venv.html
+*
