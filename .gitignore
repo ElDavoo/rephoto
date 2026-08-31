@@ -1,2 +1,14 @@
-# Created by venv; see https://docs.python.org/3/library/venv.html
-*
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Nix
+result
+result-*
+
+# Migration working data (downloaded media, metadata sidecars, manifest)
+migration_workspace/
+
+# gpmc's own cache lives under ~/.gpmc, not in-tree

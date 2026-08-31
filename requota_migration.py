@@ -33,6 +33,31 @@ def load_client_class() -> type["Client"]:
     return GpmcClient
 
 
+def call_with_auth_retry(fn, *, adb_mode: bool, client, label: str, max_pauses: int = 20):
+    """Call ``fn`` and, in ADB mode, pause+re-pull the device token on HTTP 401/403.
+
+    In ADB auth mode the bearer is a short-lived (~1h) OAuth token. When it expires
+    mid-run, this pauses for the operator to refresh the phone's token, re-pulls it,
+    and retries the same call. Outside ADB mode (or for non-auth errors), the
+    exception propagates unchanged.
+    """
+    if not adb_mode:
+        return fn()
+
+    from gpmc_adb_auth import is_auth_error, interactive_refresh
+
+    pauses = 0
+    while True:
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - re-raised below unless it's a handled 401
+            if is_auth_error(exc) and pauses < max_pauses:
+                pauses += 1
+                interactive_refresh(client, f"Auth token expired during {label} (HTTP 401/403).")
+                continue
+            raise
+
+
 BOOL_COLUMNS = {
     "is_canonical",
     "is_archived",
@@ -141,11 +166,18 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def query_quota_items(db_path: Path, limit: int | None = None) -> list[dict[str, Any]]:
+    # A photo that belongs to N albums appears as N rows in remote_media (one per
+    # collection_id), each with its own media_key but the same dedup_key. Without
+    # deduplication we would download and re-upload the same photo once per album.
+    # GROUP BY dedup_key collapses those; the single MAX(is_canonical) aggregate makes
+    # SQLite take every bare column from the canonical row of each group (documented
+    # SQLite bare-column behaviour), so we keep the authoritative copy.
     query = """
-        SELECT *
+        SELECT *, MAX(is_canonical) AS _max_canonical
         FROM remote_media
         WHERE COALESCE(quota_charged_bytes, 0) > 0
           AND COALESCE(trash_timestamp, 0) = 0
+        GROUP BY dedup_key
         ORDER BY utc_timestamp ASC, media_key ASC
     """
     params: list[Any] = []
@@ -160,6 +192,7 @@ def query_quota_items(db_path: Path, limit: int | None = None) -> list[dict[str,
     out: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
+        item.pop("_max_canonical", None)
         for col in BOOL_COLUMNS:
             if col in item and item[col] is not None:
                 item[col] = bool(item[col])
@@ -246,8 +279,12 @@ def init_manifest(manifest_path: Path, work_dir: Path, db_path: Path) -> dict[st
 
 
 def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    adb_mode = getattr(args, "adb_token", False)
     print("[1/2] Updating local cache...")
-    client.update_cache(show_progress=args.progress)
+    call_with_auth_retry(
+        lambda: client.update_cache(show_progress=args.progress),
+        adb_mode=adb_mode, client=client, label="cache update",
+    )
 
     print("[1/2] Loading quota-charged items from cache...")
     items = query_quota_items(client.db_path, limit=args.limit)
@@ -283,7 +320,10 @@ def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
 
         try:
             print(f"[1/2] ({index}/{len(items)}) Preparing download for {media_key}...")
-            urls_response = client.api.get_download_urls(media_key)
+            urls_response = call_with_auth_retry(
+                lambda: client.api.get_download_urls(media_key),
+                adb_mode=adb_mode, client=client, label=f"download-URL fetch ({media_key})",
+            )
             original_url, edited_url, discovered_urls = get_download_urls(urls_response)
             selected_url = original_url or edited_url or (discovered_urls[0] if discovered_urls else None)
             if not selected_url:
@@ -340,6 +380,7 @@ def restore_metadata(client: "Client", dedup_key: str, entry: dict[str, Any]) ->
 
 
 def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    adb_mode = getattr(args, "adb_token", False)
     manifest_path = args.manifest.resolve()
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest does not exist: {manifest_path}")
@@ -411,13 +452,16 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
                 }
 
                 print(f"[2/2] ({index}/{len(queue)}) Uploading {media_path.name}...")
-                upload_result = client.upload(
-                    target=target,
-                    use_quota=False,
-                    saver=args.saver,
-                    show_progress=args.progress,
-                    threads=1,
-                    force_upload=not args.no_force_upload,
+                upload_result = call_with_auth_retry(
+                    lambda: client.upload(
+                        target=target,
+                        use_quota=False,
+                        saver=args.saver,
+                        show_progress=args.progress,
+                        threads=1,
+                        force_upload=not args.no_force_upload,
+                    ),
+                    adb_mode=adb_mode, client=client, label=f"upload ({media_path.name})",
                 )
                 new_media_key = next(iter(upload_result.values()))
 
@@ -465,7 +509,10 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
         uploaded_entries = [item for item in entries if item.get("upload_status") == "ok" and item.get("new_media_key")]
         if uploaded_entries:
             print("[2/2] Refreshing cache to resolve new dedup keys for metadata restoration...")
-            client.update_cache(show_progress=args.progress)
+            call_with_auth_retry(
+                lambda: client.update_cache(show_progress=args.progress),
+                adb_mode=adb_mode, client=client, label="cache refresh",
+            )
             dedup_map = query_dedup_keys(client.db_path, [item["new_media_key"] for item in uploaded_entries])
             for entry in uploaded_entries:
                 new_media_key = entry["new_media_key"]
@@ -476,7 +523,10 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
                     continue
 
                 try:
-                    restore_metadata(client, dedup_key, entry)
+                    call_with_auth_retry(
+                        lambda: restore_metadata(client, dedup_key, entry),
+                        adb_mode=adb_mode, client=client, label=f"metadata restore ({new_media_key})",
+                    )
                     entry["metadata_restore_status"] = "ok"
                     entry["metadata_restored_at"] = utc_now_iso()
                 except Exception as exc:
@@ -526,6 +576,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--auth-data", default="", help="Google auth_data string. If omitted, GP_AUTH_DATA environment variable is used.")
+    parser.add_argument(
+        "--adb-token",
+        action="store_true",
+        help="Authenticate with the photos.native OAuth bearer token pulled from a rooted device via ADB, "
+        "instead of --auth-data. The token is re-pulled automatically when it expires.",
+    )
+    parser.add_argument("--adb-serial", default=None, help="adb device serial to pull the token from (optional; used with --adb-token).")
+    parser.add_argument(
+        "--adb-account-id",
+        type=int,
+        default=None,
+        help="accounts_ce.db account _id to read the token for (default: auto-detect the single Google account).",
+    )
+    parser.add_argument(
+        "--adb-token-ttl",
+        type=int,
+        default=3000,
+        help="Seconds to trust a pulled token before re-pulling from the device (default 3000, under GMS's ~1h lifetime).",
+    )
     parser.add_argument("--proxy", default="", help="Optional proxy URL in the form protocol://user:pass@host:port")
     parser.add_argument("--timeout", type=int, default=60, help="API timeout in seconds for gpmc requests.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="gpmc log level")
@@ -576,12 +645,33 @@ def main() -> int:
         print(str(exc))
         return 1
 
-    client = client_class(
-        auth_data=args.auth_data,
-        proxy=args.proxy,
-        timeout=args.timeout,
-        log_level=args.log_level,
-    )
+    if args.adb_token:
+        try:
+            from gpmc_adb_auth import attach_adb_auth, detect_google_account, minimal_auth_data
+
+            account_id = args.adb_account_id
+            if account_id is None:
+                account_id, email = detect_google_account(args.adb_serial)
+            else:
+                _, email = detect_google_account(args.adb_serial)
+            print(f"Using ADB-pulled OAuth token for {email} (account_id={account_id}).")
+            client = client_class(
+                auth_data=minimal_auth_data(email),
+                proxy=args.proxy,
+                timeout=args.timeout,
+                log_level=args.log_level,
+            )
+            attach_adb_auth(client, serial=args.adb_serial, account_id=account_id, ttl=args.adb_token_ttl)
+        except Exception as exc:  # noqa: BLE001 - surface any adb/root failure clearly
+            print(f"Failed to obtain OAuth token via ADB: {exc}")
+            return 1
+    else:
+        client = client_class(
+            auth_data=args.auth_data,
+            proxy=args.proxy,
+            timeout=args.timeout,
+            log_level=args.log_level,
+        )
 
     run_download = not args.reupload_only
     run_reupload = not args.download_only
