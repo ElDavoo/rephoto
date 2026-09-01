@@ -31,20 +31,54 @@ Pick one auth mode:
 - `--auth-data` (or the `GP_AUTH_DATA` env var): a full gpmc `auth_data` string.
 - `--adb-token`: pull the short-lived `photos.native` bearer off a rooted device via ADB
   (see `CLAUDE.md`); re-pulled automatically on expiry.
-- `--gpsoauth`: **device-free.** Hold the account's long-lived master token locally and mint
-  bearers in-process via the vendored `gpsoauth` submodule — no root, no phone. One-time
-  browser login:
+- `--gpsoauth`: **device-free** — no root, no phone. Hold the account's long-lived master
+  token locally and mint bearers in-process via the vendored `gpsoauth` submodule. See
+  **Device-free setup** below.
 
-  ```bash
-  git submodule update --init vendor/gpsoauth   # first time only
-  # non-Nix also: pip install pycryptodomex requests
-  python gpmc_gpsoauth_auth.py login --email you@gmail.com
-  # sign in at the printed EmbeddedSetup URL, then paste back the 'oauth_token' cookie
-  # (or skip the browser: --master-token aas_et/...)
-  ```
+### Device-free setup (`--gpsoauth`)
 
-  The master token is stored mode-0600 at `~/.gpmc/<email>/gpsoauth.json`; thereafter just add
-  `--gpsoauth` to any run. Bearers re-mint silently on expiry.
+A one-time browser login captures the account's master token; every run afterward is just
+`--gpsoauth`, with no phone and no interaction (bearers re-mint silently on expiry).
+
+1. **Log in once**, for the account you're migrating:
+
+   ```bash
+   git submodule update --init vendor/gpsoauth   # first clone only
+   nix develop                                   # non-Nix: pip install pycryptodomex requests
+   python gpmc_gpsoauth_auth.py login --email you@gmail.com
+   ```
+
+   It prints a Google `EmbeddedSetup` URL and waits at `Paste oauth_token:`.
+
+2. **In a browser**, open that URL and sign in as that account (2FA/passkeys work). Then copy
+   the cookie it sets and paste it back at the prompt:
+
+   - DevTools (F12) → **Application** → **Cookies** → `https://accounts.google.com`
+   - Copy the value of **`oauth_token`** (starts with `oauth2_4/`). It is single-use and
+     short-lived, so grab it promptly.
+
+   The token is exchanged for the durable master token, stored mode-0600 at
+   `~/.gpmc/<email>/gpsoauth.json`, and a test bearer is minted to confirm it works
+   (`✓ Stored and verified…`).
+
+3. **Run** with `--gpsoauth` added to any command:
+
+   ```bash
+   python requota_migration.py --gpsoauth --download-only --limit 5   # dry run
+   python requota_migration.py --gpsoauth --download-only             # full download
+   python requota_migration.py --gpsoauth --reupload-only             # re-upload
+   ```
+
+Already hold the `aas_et/…` master token? Skip the browser with
+`login --email you@gmail.com --master-token aas_et/…`.
+
+Should a mint ever fail with `UNREGISTERED_ON_API_CONSOLE`, retry against the saved token with
+the rotated Google Photos signing cert — no second browser login needed:
+
+```bash
+python gpmc_gpsoauth_auth.py login --email you@gmail.com --reuse-master \
+  --client-sig f8456b1d9986acf9ce21fb450b0d32b895f36885
+```
 
 ## Safety Notes
 
