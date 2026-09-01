@@ -10,10 +10,13 @@ automatically when gpmc considers the current one expired. If the *device's* cac
 token has itself gone stale, open the Google Photos app on the phone (or let it sync)
 so GMS mints a fresh one, then the next pull picks it up.
 
-Requires: ``adb`` on PATH, the device authorized for adb, and ``su`` (root) on device.
+Requires: ``adb`` on PATH (``adb.exe`` on Windows; override with ``GPMC_ADB``), the
+device authorized for adb, and ``su`` (root) on device.
 """
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import time
 from urllib.parse import quote
@@ -21,6 +24,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from gpmc import Client
+
+# Resolved through PATH, so plain "adb" also finds adb.exe on Windows.
+ADB_BINARY = os.environ.get("GPMC_ADB", "adb")
 
 ACCOUNTS_DB = "/data/system_ce/0/accounts_ce.db"
 SCOPE_MATCH = "photos.native"
@@ -30,7 +36,13 @@ DEFAULT_TTL = 3000
 
 
 def _adb_base(serial: str | None) -> list[str]:
-    return ["adb"] + (["-s", serial] if serial else [])
+    if shutil.which(ADB_BINARY) is None:
+        raise RuntimeError(
+            f"'{ADB_BINARY}' not found on PATH. Install platform-tools (Windows: the "
+            "Android SDK platform-tools zip, then add it to PATH) or set GPMC_ADB to "
+            "the full path of the adb executable."
+        )
+    return [ADB_BINARY] + (["-s", serial] if serial else [])
 
 
 def _run_sql(sql: str, serial: str | None = None, timeout: int = 30) -> str:
@@ -43,7 +55,8 @@ def _run_sql(sql: str, serial: str | None = None, timeout: int = 30) -> str:
         _adb_base(serial) + ["shell", f"su -c 'sqlite3 {ACCOUNTS_DB}'"],
         input=sql,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
     if proc.returncode != 0:

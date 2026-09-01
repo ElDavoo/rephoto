@@ -66,6 +66,7 @@ class CredentialStoreTests(unittest.TestCase):
             self.assertEqual(loaded["master_token"], "aas_et/x")
             self.assertEqual(loaded["android_id"], "0123456789abcdef")
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits do not exist on Windows (ACLs are set instead)")
     def test_saved_file_is_0600(self):
         with TemporaryDirectory() as d:
             path = Path(d) / "gpsoauth.json"

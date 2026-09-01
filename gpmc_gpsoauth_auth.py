@@ -13,7 +13,7 @@ One-time setup (browser only; no root, no device)::
 
 signs you in at Google's EmbeddedSetup page; you paste back the resulting
 ``oauth_token`` cookie, which is exchanged for the durable master token and
-stored (mode 0600) under ``~/.gpmc/<email>/gpsoauth.json``. Thereafter
+stored with owner-only permissions under ``~/.gpmc/<email>/gpsoauth.json``. Thereafter
 ``--gpsoauth`` mints bearers from that token with no interaction; because the
 master token is long-lived, expiry refreshes are silent (unlike the ADB
 pause/re-pull).
@@ -24,9 +24,11 @@ requests).
 """
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import secrets
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -167,6 +169,35 @@ def minimal_auth_data(email: str, lang: str = "en") -> str:
     return f"Email={quote(email)}&lang={lang}"
 
 
+def restrict_to_owner(path: Path) -> None:
+    """Make ``path`` readable by its owner only.
+
+    POSIX gets mode 0600. Windows has no mode bits — ``os.chmod`` there only
+    toggles the read-only attribute — so the ACL is rewritten instead: drop
+    inherited entries and grant the current account alone full access. If that
+    fails we say so rather than leaving a master token silently world-readable.
+    """
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+        return
+    try:
+        user = os.environ.get("USERNAME") or getpass.getuser()
+        proc = subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "icacls failed")
+    except Exception as exc:  # noqa: BLE001 - never lose the saved token over this
+        print(
+            f"⚠ Could not restrict permissions on {path} ({exc}). It holds the account's "
+            "master token — tighten its ACL manually."
+        )
+
+
 def save_credentials(
     path: "Path | str",
     *,
@@ -175,7 +206,7 @@ def save_credentials(
     android_id: str,
     client_sig: str | None = None,
 ) -> Path:
-    """Write the master-token credentials to ``path`` as mode-0600 JSON."""
+    """Write the master-token credentials to ``path`` as owner-only JSON."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -184,12 +215,12 @@ def save_credentials(
         "android_id": android_id,
         "client_sig": client_sig or PHOTOS_CLIENT_SIG,
     }
-    # Create the file private from the start, then chmod to be sure (a pre-existing
-    # file opened with O_TRUNC keeps its old mode until the explicit chmod).
+    # Create the file private from the start, then restrict it explicitly (a
+    # pre-existing file opened with O_TRUNC keeps its old permissions).
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
-    os.chmod(path, 0o600)
+    restrict_to_owner(path)
     return path
 
 
@@ -392,7 +423,7 @@ def _login_cli(args) -> int:
     try:
         mint_bearer(email, master_token, android_id, client_sig=client_sig, proxy=args.proxy)
     except Exception as exc:  # noqa: BLE001 - report but keep the saved master token
-        print(f"⚠ Stored the master token at {path} (mode 0600), but a test bearer could not be minted:")
+        print(f"⚠ Stored the master token at {path} (owner-only), but a test bearer could not be minted:")
         print(f"    {exc}")
         print("  The master token is saved; retry the mint without another browser login:")
         print(
@@ -400,7 +431,7 @@ def _login_cli(args) -> int:
             f"--client-sig {PHOTOS_CLIENT_SIG_ROTATED}"
         )
         return 1
-    print(f"✓ Stored and verified gpsoauth credentials for {email} at {path} (mode 0600).")
+    print(f"✓ Stored and verified gpsoauth credentials for {email} at {path} (owner-only).")
     print(f"  android_id={android_id}  client_sig={client_sig}")
     print("Next:  python requota_migration.py --gpsoauth --download-only --limit 5")
     return 0
@@ -418,6 +449,16 @@ def _bearer_cli(args) -> int:
 
 def main() -> int:
     import argparse
+
+    # A Windows console (and any redirected output) defaults to a legacy code page
+    # that cannot encode the status symbols below.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
 
     ap = argparse.ArgumentParser(description="Manage the gpsoauth master-token auth source for gpmc.")
     sub = ap.add_subparsers(dest="cmd", required=True)

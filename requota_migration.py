@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import mimetypes
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -130,11 +133,150 @@ def chunked(items: list[str], size: int) -> list[list[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-def sanitize_filename(name: str) -> str:
-    clean = name.replace("/", "_").replace("\\", "_").strip()
+# ------------------------------------------------------------------ portability
+
+IS_WINDOWS = os.name == "nt"
+
+# Windows forbids <>:"/\|?* and the control range in a path component, treats the
+# DOS device names as reserved (even with an extension), and silently strips
+# trailing dots/spaces. Applying all of that everywhere keeps a workspace copied
+# between machines consistent, so we never branch on the platform here.
+_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+MAX_KEY_LENGTH = 64
+MAX_NAME_LENGTH = 150
+
+# 1980-01-01: the oldest timestamp Windows will store on a file.
+MIN_FILE_TIMESTAMP = 315_532_800
+# Above this, a value cannot be seconds (it would be past year 5138), so it is
+# the millisecond form the cache actually stores.
+MILLISECOND_THRESHOLD = 100_000_000_000
+
+# Extensions gpmc must recognise as image/video, or it refuses to upload the file
+# ("File's mime type does not match image or video mime type"). On Windows the
+# mimetypes module seeds itself from HKEY_CLASSES_ROOT and those registry entries
+# override the built-in table, so whichever app last claimed .jpg/.mp4/.heic
+# decides what gpmc sees. Registering them explicitly wins over the registry, and
+# also fills in types (HEIC/HEIF/AVIF) Python does not ship on any platform.
+MEDIA_MIMETYPES = {
+    ".avif": "image/avif",
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+    ".jfif": "image/jpeg",
+    ".jpe": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".webp": "image/webp",
+    ".3gp": "video/3gpp",
+    ".avi": "video/x-msvideo",
+    ".m2ts": "video/mp2t",
+    ".m4v": "video/x-m4v",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".mp4": "video/mp4",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
+    ".mts": "video/mp2t",
+    ".webm": "video/webm",
+    ".wmv": "video/x-ms-wmv",
+}
+
+
+def register_media_mimetypes() -> None:
+    """Pin the media types gpmc filters on, whatever the OS registry says."""
+    for extension, mime_type in MEDIA_MIMETYPES.items():
+        mimetypes.add_type(mime_type, extension)
+
+
+def configure_stdio() -> None:
+    """Force UTF-8 on stdout/stderr so status lines survive a legacy code page.
+
+    A Windows console (and any redirect to a file) defaults to cp1252, which
+    raises UnicodeEncodeError on the symbols we print and on non-ASCII filenames.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def warn_on_long_paths(work_dir: Path) -> None:
+    """Warn when the workspace sits so deep that Windows' MAX_PATH could bite."""
+    if not IS_WINDOWS:
+        return
+    longest = len(str(work_dir)) + len("\\metadata\\") + MAX_NAME_LENGTH
+    if longest > 259:
+        print(
+            f"! Workspace path is long ({work_dir}); generated file paths may exceed the\n"
+            "  260-character Windows limit. Use a shorter --work-dir (e.g. C:\\gp) or enable\n"
+            "  long paths (HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\\LongPathsEnabled=1)."
+        )
+
+
+def sanitize_filename(name: str, max_length: int = MAX_NAME_LENGTH) -> str:
+    """Return ``name`` as a single path component that is legal on any platform."""
+    clean = _ILLEGAL_NAME_CHARS.sub("_", name).strip().rstrip(". ")
     if not clean:
-        clean = "unnamed"
+        return "unnamed"
+    if clean.partition(".")[0].upper() in _RESERVED_NAMES:
+        clean = f"_{clean}"
+    if len(clean) > max_length:
+        suffix = Path(clean).suffix[:16]
+        clean = clean[: max_length - len(suffix)].rstrip(". ") + suffix
     return clean
+
+
+def workspace_name(media_key: str, file_name: str) -> str:
+    """Build the ``<media_key>_<file_name>`` workspace name, portable and capped."""
+    return sanitize_filename(f"{sanitize_filename(media_key, MAX_KEY_LENGTH)}_{file_name}")
+
+
+def to_epoch_seconds(value: Any) -> int | None:
+    """Normalise a cache timestamp to whole seconds, or None if unusable.
+
+    ``remote_media.utc_timestamp`` is in **milliseconds**. Passed straight to
+    ``os.utime`` it dates files to the year 58000 — which Linux accepts and
+    Windows rejects outright (its file times stop at year 30828) — and gpmc sends
+    the mtime as the re-uploaded item's timestamp, so the seconds form is also
+    the correct one.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    if number > MILLISECOND_THRESHOLD:
+        number //= 1000
+    return number
+
+
+def set_file_mtime(path: Path, timestamp: int | None) -> None:
+    """Stamp ``path`` with ``timestamp``; warn rather than fail the item."""
+    if timestamp is None:
+        return
+    if IS_WINDOWS and timestamp < MIN_FILE_TIMESTAMP:
+        timestamp = MIN_FILE_TIMESTAMP
+    try:
+        if os.utime in os.supports_follow_symlinks:
+            os.utime(path, (timestamp, timestamp), follow_symlinks=False)
+        else:  # Windows only exposes the symlink-following form
+            os.utime(path, (timestamp, timestamp))
+    except (OSError, ValueError, NotImplementedError) as exc:
+        print(f"    ! Could not set mtime on {path.name}: {exc}")
 
 
 def normalize_caption(value: Any) -> str:
@@ -208,7 +350,9 @@ def query_quota_items(db_path: Path, limit: int | None = None) -> list[dict[str,
         query += " LIMIT ?"
         params.append(limit)
 
-    with sqlite3.connect(db_path) as conn:
+    # closing(): sqlite3's own context manager commits but never closes, and a
+    # handle left open on the cache DB blocks gpmc's later writes on Windows.
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(query, params).fetchall()
 
@@ -228,7 +372,7 @@ def query_dedup_keys(db_path: Path, media_keys: list[str]) -> dict[str, str]:
         return {}
 
     result: dict[str, str] = {}
-    with sqlite3.connect(db_path) as conn:
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         for batch in chunked(media_keys, 400):
             placeholders = ",".join("?" for _ in batch)
@@ -323,9 +467,9 @@ def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
     for index, item in enumerate(items, start=1):
         media_key = item["media_key"]
         file_name = sanitize_filename(item.get("file_name") or f"{media_key}.bin")
-        local_name = f"{media_key}_{file_name}"
+        local_name = workspace_name(media_key, file_name)
         local_path = files_dir / local_name
-        metadata_path = metadata_dir / f"{media_key}.json"
+        metadata_path = metadata_dir / f"{sanitize_filename(media_key, MAX_KEY_LENGTH)}.json"
 
         entry: dict[str, Any] = {
             "media_key": media_key,
@@ -361,8 +505,12 @@ def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
             else:
                 download_file(selected_url, local_path, timeout=args.download_timeout, retries=args.download_retries)
 
-            timestamp = int(item.get("utc_timestamp") or item.get("server_creation_timestamp") or time.time())
-            os.utime(local_path, (timestamp, timestamp), follow_symlinks=False)
+            timestamp = (
+                to_epoch_seconds(item.get("utc_timestamp"))
+                or to_epoch_seconds(item.get("server_creation_timestamp"))
+                or int(time.time())
+            )
+            set_file_mtime(local_path, timestamp)
 
             sidecar = {
                 "downloaded_at": utc_now_iso(),
@@ -465,8 +613,8 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
                         entry["old_media_deleted_before_upload"] = False
                         entry["old_media_deleted_before_upload_error"] = "missing dedup_key"
 
-                timestamp = int(entry.get("utc_timestamp") or time.time())
-                os.utime(media_path, (timestamp, timestamp), follow_symlinks=False)
+                timestamp = to_epoch_seconds(entry.get("utc_timestamp")) or int(time.time())
+                set_file_mtime(media_path, timestamp)
 
                 target = {
                     media_path: {
@@ -670,6 +818,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    configure_stdio()
+    register_media_mimetypes()
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -678,6 +829,7 @@ def main() -> int:
 
     args.work_dir = args.work_dir.resolve()
     args.manifest = args.manifest.resolve() if args.manifest else (args.work_dir / "manifest.json").resolve()
+    warn_on_long_paths(args.work_dir)
 
     try:
         client_class = load_client_class()

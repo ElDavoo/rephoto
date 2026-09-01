@@ -23,6 +23,9 @@ nix develop                            # python + gpmc deps (bbpb, rich, request
 - The submodule is pure-Python and is put on `sys.path` at runtime by `load_client_class()`, so the **pinned submodule commit is the gpmc code that runs** — not any pip-installed copy.
 - No `sqlite3` CLI on the host; inspect the cache DB with Python's `sqlite3` module.
 - Non-Nix fallback only: `cd google_photos_mobile_client && pip install -e .` (see README).
+- **Windows is supported too** (stock CPython, no WSL): same commands with `py`/`python`.
+  The portability helpers live in the "portability" section of `requota_migration.py` — see
+  Architecture below.
 
 ## Running
 
@@ -39,8 +42,9 @@ python requota_migration.py --adb-token --reupload-only
 in-process from a stored master token; one-time `python gpmc_gpsoauth_auth.py login --email
 you@gmail.com`, see Auth below). Syntax-check edits with
 `python -m py_compile requota_migration.py gpmc_adb_auth.py gpmc_gpsoauth_auth.py`.
-Offline unit tests for the gpsoauth path live at the repo root and need no network/creds:
-`python tests/test_gpsoauth_auth.py` and `python tests/test_auth_retry.py` (stdlib unittest).
+Offline unit tests live at the repo root and need no network/creds:
+`python tests/test_gpsoauth_auth.py`, `python tests/test_auth_retry.py` and
+`python tests/test_portability.py` (stdlib unittest).
 
 Tests live only in the submodule: `cd google_photos_mobile_client && python -m pytest`.
 Most tests need a live `GP_AUTH_DATA` and fail without it; the offline ones are
@@ -84,6 +88,20 @@ is long-lived the refresher re-mints **silently** on 401 (no operator pause). Th
 comes from a one-time browser `EmbeddedSetup` login (`exchange_token`) or is supplied directly
 (`--master-token`), and is stored mode-0600 at `~/.gpmc/<email>/gpsoauth.json`
 (auto-discovered by `resolve_store_path`).
+
+**Cross-platform bits are centralised in one section.** `requota_migration.py` has a
+"portability" block holding everything that differs off Linux, all of it applied
+unconditionally so a workspace is identical on every OS: `sanitize_filename` /
+`workspace_name` (Windows-illegal characters, DOS device names, trailing dots, a 150-char cap
+that keeps names clear of `MAX_PATH`), `to_epoch_seconds` + `set_file_mtime` (the cache stores
+`utc_timestamp` in **milliseconds**; that value dates files to year 58000, which Linux accepts
+and Windows rejects — and gpmc sends the mtime as the re-uploaded item's timestamp, so seconds
+is also the correct value), `register_media_mimetypes` (on Windows `mimetypes` seeds from
+HKEY_CLASSES_ROOT and those entries *override* the built-in table, which can make gpmc's
+image/video filter reject a perfectly good `.jpg`), and `configure_stdio` (UTF-8 output on a
+cp1252 console). ADB mode resolves `adb`/`adb.exe` through `PATH` (override: `GPMC_ADB`);
+`restrict_to_owner` in `gpmc_gpsoauth_auth.py` is `chmod 0600` on POSIX and an `icacls`
+owner-only ACL on Windows.
 
 ## Gotchas
 

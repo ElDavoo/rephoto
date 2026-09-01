@@ -24,6 +24,31 @@ pip install -e .
 cd ..
 ```
 
+### Windows
+
+Linux, macOS and Windows are all supported; on Windows use stock CPython (no WSL needed):
+
+```powershell
+git submodule update --init
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e google_photos_mobile_client
+pip install pycryptodomex            # only for --gpsoauth (requests comes with gpmc)
+py requota_migration.py --gpsoauth --download-only --limit 5
+```
+
+Windows specifics:
+
+- **Keep the workspace path short.** Paths over 260 characters fail unless long paths are
+  enabled (`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled=1`), so prefer
+  something like `--work-dir C:\gp`. The script warns when the path is at risk.
+- **`--adb-token`** needs `adb.exe` on `PATH` (Android SDK platform-tools); point `GPMC_ADB`
+  at the executable if it lives elsewhere. The device still has to be rooted.
+- **Credentials permissions:** Windows has no POSIX mode bits, so `~/.gpmc/<email>/gpsoauth.json`
+  is locked down with an owner-only ACL (`icacls`) instead of `chmod 0600`.
+- Downloaded file names are sanitized for Windows (reserved characters and device names), and
+  output is forced to UTF-8 so the status lines survive a redirect to a file.
+
 ## Authentication
 
 Pick one auth mode:
@@ -57,7 +82,7 @@ A one-time browser login captures the account's master token; every run afterwar
    - Copy the value of **`oauth_token`** (starts with `oauth2_4/`). It is single-use and
      short-lived, so grab it promptly.
 
-   The token is exchanged for the durable master token, stored mode-0600 at
+   The token is exchanged for the durable master token, stored with owner-only permissions at
    `~/.gpmc/<email>/gpsoauth.json`, and a test bearer is minted to confirm it works
    (`✓ Stored and verified…`).
 
