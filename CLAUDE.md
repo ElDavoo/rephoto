@@ -35,8 +35,12 @@ python requota_migration.py --adb-token --reupload-only
 ```
 
 `--adb-token` is the auth path used here (see below). The original `--auth-data` /
-`GP_AUTH_DATA` path still works. Syntax-check edits with
-`python -m py_compile requota_migration.py gpmc_adb_auth.py`.
+`GP_AUTH_DATA` path still works, as does the device-free `--gpsoauth` path (mint bearers
+in-process from a stored master token; one-time `python gpmc_gpsoauth_auth.py login --email
+you@gmail.com`, see Auth below). Syntax-check edits with
+`python -m py_compile requota_migration.py gpmc_adb_auth.py gpmc_gpsoauth_auth.py`.
+Offline unit tests for the gpsoauth path live at the repo root and need no network/creds:
+`python tests/test_gpsoauth_auth.py` and `python tests/test_auth_retry.py` (stdlib unittest).
 
 Tests live only in the submodule: `cd google_photos_mobile_client && python -m pytest`.
 Most tests need a live `GP_AUTH_DATA` and fail without it; the offline ones are
@@ -65,9 +69,21 @@ restore also keys on `dedup_key`, not `media_key`.
 `/data/system_ce/0/accounts_ce.db`) and writes it into `client.api.auth_response_cache`,
 overriding gpmc's `_get_auth_token()` so the normal `/auth` master-token exchange is
 bypassed. The bearer is short-lived (~1h); it auto-refetches from the device on expiry.
-On an HTTP 401/403 mid-run, `call_with_auth_retry()` (wrapping every gpmc network call:
-`update_cache`, `get_download_urls`, `upload`, metadata restore) pauses for the operator
-to refresh the phone's token, re-pulls, and retries.
+On an HTTP 401/403 mid-run, `call_with_auth_retry(fn, *, on_auth_error=...)` (wrapping every
+gpmc network call: `update_cache`, `get_download_urls`, `upload`, metadata restore) invokes a
+mode-specific refresher and retries; `build_auth_refresher()` picks it. In ADB mode that
+refresher pauses for the operator to refresh the phone's token, then re-pulls.
+
+**Device-free auth is minted in-process (`--gpsoauth`).** `gpmc_gpsoauth_auth.py` holds the
+account's long-lived AAS master token locally and mints `photos.native` bearers with the
+vendored `gpsoauth` submodule (`vendor/gpsoauth`, upstream `simon-weber/gpsoauth`) via its
+`/auth` exchange (`perform_oauth`, app `com.google.android.apps.photos`, first-party
+`client_sig` `38918a…5788`) — the same call gpmc's own `_get_auth_token()` makes.
+`attach_gpsoauth_auth()` installs it exactly like the ADB path, but because the master token
+is long-lived the refresher re-mints **silently** on 401 (no operator pause). The master token
+comes from a one-time browser `EmbeddedSetup` login (`exchange_token`) or is supplied directly
+(`--master-token`), and is stored mode-0600 at `~/.gpmc/<email>/gpsoauth.json`
+(auto-discovered by `resolve_store_path`).
 
 ## Gotchas
 
@@ -79,6 +95,9 @@ to refresh the phone's token, re-pulls, and retries.
   `xob0t/gpmc`; its `main` is kept synced, but the **pinned commit is on the fork's
   `fixes` branch**. When changing gpmc behaviour, know whether you're editing the
   submodule or this repo.
+- There are now **two submodules**: `google_photos_mobile_client` (gpmc) and
+  `vendor/gpsoauth` (used only by `--gpsoauth`, pinned to upstream `simon-weber/gpsoauth`).
+  `git submodule update --init` initializes both; the devshell adds `pycryptodomex` for it.
 - **Album backup/restore is deferred (TODO).** gpmc discards album envelope items and
   doesn't store album titles; `collection_id` alone is ambiguous (mixes user albums with
   auto-groupings), so implementing it needs mobile-API reverse-engineering or a Takeout

@@ -1,3 +1,6 @@
 [submodule "google_photos_mobile_client"]
 	path = google_photos_mobile_client
 	url = git@github.com:ElDavoo/google_photos_mobile_client.git
+[submodule "gpsoauth"]
+	path = vendor/gpsoauth
+	url = https://github.com/simon-weber/gpsoauth.git

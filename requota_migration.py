@@ -33,18 +33,19 @@ def load_client_class() -> type["Client"]:
     return GpmcClient
 
 
-def call_with_auth_retry(fn, *, adb_mode: bool, client, label: str, max_pauses: int = 20):
-    """Call ``fn`` and, in ADB mode, pause+re-pull the device token on HTTP 401/403.
+def call_with_auth_retry(fn, *, on_auth_error=None, label: str, max_pauses: int = 20):
+    """Call ``fn`` and, when a refresher is provided, recover from HTTP 401/403.
 
-    In ADB auth mode the bearer is a short-lived (~1h) OAuth token. When it expires
-    mid-run, this pauses for the operator to refresh the phone's token, re-pulls it,
-    and retries the same call. Outside ADB mode (or for non-auth errors), the
-    exception propagates unchanged.
+    The bearer used by ``--adb-token`` / ``--gpsoauth`` is short-lived. When it
+    expires mid-run, ``on_auth_error(reason)`` refreshes it (ADB: pause + re-pull
+    the device token; gpsoauth: silently re-mint from the master token) and the
+    call is retried. With no refresher (static ``--auth-data``) or for non-auth
+    errors, the exception propagates unchanged.
     """
-    if not adb_mode:
+    if on_auth_error is None:
         return fn()
 
-    from gpmc_adb_auth import is_auth_error, interactive_refresh
+    from gpmc_adb_auth import is_auth_error
 
     pauses = 0
     while True:
@@ -53,9 +54,31 @@ def call_with_auth_retry(fn, *, adb_mode: bool, client, label: str, max_pauses: 
         except Exception as exc:  # noqa: BLE001 - re-raised below unless it's a handled 401
             if is_auth_error(exc) and pauses < max_pauses:
                 pauses += 1
-                interactive_refresh(client, f"Auth token expired during {label} (HTTP 401/403).")
+                on_auth_error(f"Auth token expired during {label} (HTTP 401/403).")
                 continue
             raise
+
+
+def build_auth_refresher(client, args):
+    """Return an ``on_auth_error(reason)`` callable for the active auth mode.
+
+    ``--adb-token`` pauses for the operator and re-pulls the device token;
+    ``--gpsoauth`` silently re-mints a bearer from the stored master token;
+    static ``--auth-data`` has no refresher (auth errors propagate).
+    """
+    if getattr(args, "adb_token", False):
+        from gpmc_adb_auth import interactive_refresh
+
+        return lambda reason: interactive_refresh(client, reason)
+    if getattr(args, "gpsoauth", False):
+        from gpmc_gpsoauth_auth import force_refresh
+
+        def _refresh(reason: str) -> None:
+            print(f"↻ {reason} Re-minting bearer via gpsoauth...")
+            force_refresh(client)
+
+        return _refresh
+    return None
 
 
 BOOL_COLUMNS = {
@@ -279,11 +302,11 @@ def init_manifest(manifest_path: Path, work_dir: Path, db_path: Path) -> dict[st
 
 
 def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str, Any], int]:
-    adb_mode = getattr(args, "adb_token", False)
+    refresher = build_auth_refresher(client, args)
     print("[1/2] Updating local cache...")
     call_with_auth_retry(
         lambda: client.update_cache(show_progress=args.progress),
-        adb_mode=adb_mode, client=client, label="cache update",
+        on_auth_error=refresher, label="cache update",
     )
 
     print("[1/2] Loading quota-charged items from cache...")
@@ -322,7 +345,7 @@ def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
             print(f"[1/2] ({index}/{len(items)}) Preparing download for {media_key}...")
             urls_response = call_with_auth_retry(
                 lambda: client.api.get_download_urls(media_key),
-                adb_mode=adb_mode, client=client, label=f"download-URL fetch ({media_key})",
+                on_auth_error=refresher, label=f"download-URL fetch ({media_key})",
             )
             original_url, edited_url, discovered_urls = get_download_urls(urls_response)
             selected_url = original_url or edited_url or (discovered_urls[0] if discovered_urls else None)
@@ -380,7 +403,7 @@ def restore_metadata(client: "Client", dedup_key: str, entry: dict[str, Any]) ->
 
 
 def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str, Any], int]:
-    adb_mode = getattr(args, "adb_token", False)
+    refresher = build_auth_refresher(client, args)
     manifest_path = args.manifest.resolve()
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest does not exist: {manifest_path}")
@@ -461,7 +484,7 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
                         threads=1,
                         force_upload=not args.no_force_upload,
                     ),
-                    adb_mode=adb_mode, client=client, label=f"upload ({media_path.name})",
+                    on_auth_error=refresher, label=f"upload ({media_path.name})",
                 )
                 new_media_key = next(iter(upload_result.values()))
 
@@ -511,7 +534,7 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
             print("[2/2] Refreshing cache to resolve new dedup keys for metadata restoration...")
             call_with_auth_retry(
                 lambda: client.update_cache(show_progress=args.progress),
-                adb_mode=adb_mode, client=client, label="cache refresh",
+                on_auth_error=refresher, label="cache refresh",
             )
             dedup_map = query_dedup_keys(client.db_path, [item["new_media_key"] for item in uploaded_entries])
             for entry in uploaded_entries:
@@ -525,7 +548,7 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
                 try:
                     call_with_auth_retry(
                         lambda: restore_metadata(client, dedup_key, entry),
-                        adb_mode=adb_mode, client=client, label=f"metadata restore ({new_media_key})",
+                        on_auth_error=refresher, label=f"metadata restore ({new_media_key})",
                     )
                     entry["metadata_restore_status"] = "ok"
                     entry["metadata_restored_at"] = utc_now_iso()
@@ -595,6 +618,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=3000,
         help="Seconds to trust a pulled token before re-pulling from the device (default 3000, under GMS's ~1h lifetime).",
     )
+    parser.add_argument(
+        "--gpsoauth",
+        action="store_true",
+        help="Authenticate device-free by minting bearers in-process from a stored gpsoauth master token, "
+        "instead of --auth-data/--adb-token. Run `python gpmc_gpsoauth_auth.py login` once first. "
+        "Bearers re-mint silently on expiry.",
+    )
+    parser.add_argument(
+        "--gpsoauth-store",
+        default=None,
+        help="Path to the gpsoauth credentials file (default: auto-detect ~/.gpmc/<email>/gpsoauth.json).",
+    )
+    parser.add_argument(
+        "--gpsoauth-email",
+        default=None,
+        help="Account email for --gpsoauth, to select ~/.gpmc/<email>/gpsoauth.json when several exist.",
+    )
     parser.add_argument("--proxy", default="", help="Optional proxy URL in the form protocol://user:pass@host:port")
     parser.add_argument("--timeout", type=int, default=60, help="API timeout in seconds for gpmc requests.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="gpmc log level")
@@ -645,6 +685,10 @@ def main() -> int:
         print(str(exc))
         return 1
 
+    if args.adb_token and args.gpsoauth:
+        print("Choose a single auth mode: --adb-token or --gpsoauth, not both.")
+        return 1
+
     if args.adb_token:
         try:
             from gpmc_adb_auth import attach_adb_auth, detect_google_account, minimal_auth_data
@@ -664,6 +708,36 @@ def main() -> int:
             attach_adb_auth(client, serial=args.adb_serial, account_id=account_id, ttl=args.adb_token_ttl)
         except Exception as exc:  # noqa: BLE001 - surface any adb/root failure clearly
             print(f"Failed to obtain OAuth token via ADB: {exc}")
+            return 1
+    elif args.gpsoauth:
+        try:
+            from gpmc_gpsoauth_auth import (
+                attach_gpsoauth_auth,
+                load_credentials,
+                minimal_auth_data,
+                resolve_store_path,
+            )
+
+            store_path = resolve_store_path(store=args.gpsoauth_store, email=args.gpsoauth_email)
+            creds = load_credentials(store_path)
+            email = creds["email"]
+            print(f"Using in-process gpsoauth bearer for {email} (creds: {store_path}).")
+            client = client_class(
+                auth_data=minimal_auth_data(email),
+                proxy=args.proxy,
+                timeout=args.timeout,
+                log_level=args.log_level,
+            )
+            attach_gpsoauth_auth(
+                client,
+                email,
+                creds["master_token"],
+                creds["android_id"],
+                client_sig=creds.get("client_sig"),
+                proxy=args.proxy or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface any credential/mint failure clearly
+            print(f"Failed to authenticate via gpsoauth: {exc}")
             return 1
     else:
         client = client_class(

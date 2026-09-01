@@ -24,6 +24,28 @@ pip install -e .
 cd ..
 ```
 
+## Authentication
+
+Pick one auth mode:
+
+- `--auth-data` (or the `GP_AUTH_DATA` env var): a full gpmc `auth_data` string.
+- `--adb-token`: pull the short-lived `photos.native` bearer off a rooted device via ADB
+  (see `CLAUDE.md`); re-pulled automatically on expiry.
+- `--gpsoauth`: **device-free.** Hold the account's long-lived master token locally and mint
+  bearers in-process via the vendored `gpsoauth` submodule — no root, no phone. One-time
+  browser login:
+
+  ```bash
+  git submodule update --init vendor/gpsoauth   # first time only
+  # non-Nix also: pip install pycryptodomex requests
+  python gpmc_gpsoauth_auth.py login --email you@gmail.com
+  # sign in at the printed EmbeddedSetup URL, then paste back the 'oauth_token' cookie
+  # (or skip the browser: --master-token aas_et/...)
+  ```
+
+  The master token is stored mode-0600 at `~/.gpmc/<email>/gpsoauth.json`; thereafter just add
+  `--gpsoauth` to any run. Bearers re-mint silently on expiry.
+
 ## Safety Notes
 
 - During re-upload, originals are deleted before upload by default.
