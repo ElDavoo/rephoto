@@ -43,8 +43,9 @@ in-process from a stored master token; one-time `python gpmc_gpsoauth_auth.py lo
 you@gmail.com`, see Auth below). Syntax-check edits with
 `python -m py_compile requota_migration.py gpmc_adb_auth.py gpmc_gpsoauth_auth.py`.
 Offline unit tests live at the repo root and need no network/creds:
-`python tests/test_gpsoauth_auth.py`, `python tests/test_auth_retry.py` and
-`python tests/test_portability.py` (stdlib unittest).
+`python tests/test_gpsoauth_auth.py`, `python tests/test_auth_retry.py`,
+`python tests/test_delete_resilience.py` and `python tests/test_portability.py`
+(stdlib unittest).
 
 Tests live only in the submodule: `cd google_photos_mobile_client && python -m pytest`.
 Most tests need a live `GP_AUTH_DATA` and fail without it; the offline ones are
@@ -73,10 +74,23 @@ restore also keys on `dedup_key`, not `media_key`.
 `/data/system_ce/0/accounts_ce.db`) and writes it into `client.api.auth_response_cache`,
 overriding gpmc's `_get_auth_token()` so the normal `/auth` master-token exchange is
 bypassed. The bearer is short-lived (~1h); it auto-refetches from the device on expiry.
-On an HTTP 401/403 mid-run, `call_with_auth_retry(fn, *, on_auth_error=...)` (wrapping every
-gpmc network call: `update_cache`, `get_download_urls`, `upload`, metadata restore) invokes a
-mode-specific refresher and retries; `build_auth_refresher()` picks it. In ADB mode that
-refresher pauses for the operator to refresh the phone's token, then re-pulls.
+On an HTTP 401/403 mid-run, `call_with_retry(fn, *, on_auth_error=...)` (wrapping every
+gpmc network call: `update_cache`, `get_download_urls`, `upload`, metadata restore, deletes)
+invokes a mode-specific refresher and retries; `build_auth_refresher()` picks it. In ADB mode
+that refresher pauses for the operator to refresh the phone's token, then re-pulls.
+
+**Transient failures are retried in the same wrapper.** `call_with_retry` also retries
+`is_transient_error()` failures — 5xx/429/408 by status, plus anything deriving from `OSError`
+(connection reset, DNS, read timeout) — `--network-retries` times (default 5) with exponential
+backoff + jitter (`retry_delay`, base `--network-backoff-seconds`, capped at 120s); auth
+refreshes and transient retries have separate budgets. The photos API returns sporadic 500s,
+and a library-sized run must survive them. Both phases flush the manifest every
+`MANIFEST_FLUSH_INTERVAL` items so a killed run keeps its work, and `reupload_phase` is
+resumable end to end: an all-uploaded manifest no longer short-circuits the phase, metadata
+restore skips entries already `ok`, and `--delete-originals` skips originals already gone. A
+failed delete batch falls back to key-by-key deletes, records `old_media_delete_error` per
+entry and keeps going instead of aborting the run (deletion failures are added to the phase's
+returned failure count).
 
 **Device-free auth is minted in-process (`--gpsoauth`).** `gpmc_gpsoauth_auth.py` holds the
 account's long-lived AAS master token locally and mints `photos.native` bearers with the

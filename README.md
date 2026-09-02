@@ -113,6 +113,33 @@ python gpmc_gpsoauth_auth.py login --email you@gmail.com --reuse-master \
 - Keep the generated manifest and sidecar metadata until you verify the migration.
 - Without `--delete-originals`, storage usage will not drop.
 
+## Network Resilience
+
+Every API call (cache sync, download-URL fetch, upload, metadata restore, deletion)
+is retried on transient failures — HTTP 5xx/429/408, connection resets, DNS blips
+and read timeouts — with exponential backoff and jitter. Google's photos endpoints
+return sporadic 500s on perfectly valid requests, so a run over a whole library
+would otherwise die hours in.
+
+```bash
+python requota_migration.py --network-retries 8 --network-backoff-seconds 5
+```
+
+- `--network-retries N` (default 5, `0` disables): retries per API call.
+- `--network-backoff-seconds S` (default 3): base delay; doubles per attempt with
+  jitter, capped at 120s.
+- `--download-retries N` (default 5): retries per media file download. A dropped
+  connection discards the partial `.part` file, so no truncated original is kept.
+- HTTP 401/403 is handled separately: `--adb-token` / `--gpsoauth` refresh the
+  bearer and retry, without consuming a network retry.
+
+Both phases flush the manifest as they go, and both are resumable: re-running
+`--reupload-only` skips items already uploaded, restores only metadata not yet
+restored, and (with `--delete-originals`) retries only originals still present.
+Items whose original could not be deleted keep an `old_media_delete_error` in the
+manifest, and a failed batch is retried key by key so one rejected item does not
+strand the other 499.
+
 ## Typical Runs
 
 Dry run on first 20 items, download only:

@@ -6,6 +6,7 @@ import contextlib
 import json
 import mimetypes
 import os
+import random
 import re
 import sqlite3
 import sys
@@ -36,30 +37,117 @@ def load_client_class() -> type["Client"]:
     return GpmcClient
 
 
-def call_with_auth_retry(fn, *, on_auth_error=None, label: str, max_pauses: int = 20):
-    """Call ``fn`` and, when a refresher is provided, recover from HTTP 401/403.
+# HTTP statuses that mean "the server hiccuped, ask again" rather than "no".
+TRANSIENT_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 509}
 
-    The bearer used by ``--adb-token`` / ``--gpsoauth`` is short-lived. When it
-    expires mid-run, ``on_auth_error(reason)`` refreshes it (ADB: pause + re-pull
-    the device token; gpsoauth: silently re-mint from the master token) and the
-    call is retried. With no refresher (static ``--auth-data``) or for non-auth
-    errors, the exception propagates unchanged.
+NETWORK_RETRIES = 5
+NETWORK_BACKOFF_SECONDS = 3.0
+NETWORK_BACKOFF_CAP_SECONDS = 120.0
+
+# How often the download phase flushes the manifest, so an aborted run keeps its work.
+MANIFEST_FLUSH_INTERVAL = 50
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """True for failures worth retrying unchanged: 5xx/429/408 and connectivity errors.
+
+    HTTP errors are classified by status: a 4xx other than 408/429 is a real
+    rejection, not a blip. Errors without a response are checked against
+    ``OSError`` -- every ``requests`` and ``socket`` failure (connection reset,
+    DNS, read timeout, chunked-encoding truncation) derives from it -- and then
+    against the same message markers the upload queue uses.
     """
-    if on_auth_error is None:
-        return fn()
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        try:
+            return int(status) in TRANSIENT_STATUS_CODES
+        except (TypeError, ValueError):
+            return False
+    if isinstance(exc, OSError):
+        return True
+    return is_retryable_upload_error(str(exc))
 
+
+def retry_delay(attempt: int, backoff: float) -> float:
+    """Backoff for retry ``attempt`` (1-based): exponential, capped, with equal jitter.
+
+    Jitter matters here because a library-wide run hammers one endpoint: without it
+    every retry after a server-side wobble lands at the same instant.
+    """
+    ceiling = min(backoff * (2 ** (attempt - 1)), NETWORK_BACKOFF_CAP_SECONDS)
+    return ceiling / 2 + random.uniform(0, ceiling / 2)
+
+
+def call_with_retry(
+    fn,
+    *,
+    on_auth_error=None,
+    label: str,
+    max_pauses: int = 20,
+    retries: int = NETWORK_RETRIES,
+    backoff: float = NETWORK_BACKOFF_SECONDS,
+):
+    """Call ``fn``, recovering from expired bearers *and* transient network failures.
+
+    Two independent recoveries share one loop:
+
+    * **HTTP 401/403** -- the bearer used by ``--adb-token`` / ``--gpsoauth`` is
+      short-lived. ``on_auth_error(reason)`` refreshes it (ADB: pause + re-pull the
+      device token; gpsoauth: silently re-mint from the master token) and the call
+      is retried. With no refresher (static ``--auth-data``) auth errors propagate.
+    * **Transient failures** -- 5xx/429/408 plus connection and timeout errors are
+      retried up to ``retries`` times with exponential backoff and jitter. The
+      photos endpoints hand out sporadic 500s on perfectly valid requests, and a
+      run over a whole library must not die on one.
+
+    Auth refreshes do not consume transient attempts (and vice versa); any other
+    error propagates unchanged.
+    """
     from gpmc_adb_auth import is_auth_error
 
     pauses = 0
+    attempts = 0
     while True:
         try:
             return fn()
-        except Exception as exc:  # noqa: BLE001 - re-raised below unless it's a handled 401
-            if is_auth_error(exc) and pauses < max_pauses:
+        except Exception as exc:  # noqa: BLE001 - re-raised below unless it's handled here
+            if on_auth_error is not None and is_auth_error(exc) and pauses < max_pauses:
                 pauses += 1
                 on_auth_error(f"Auth token expired during {label} (HTTP 401/403).")
                 continue
+            if is_transient_error(exc) and attempts < retries:
+                attempts += 1
+                delay = retry_delay(attempts, backoff)
+                print(f"↻ Transient failure during {label} ({attempts}/{retries}): {exc}")
+                print(f"   Retrying in {delay:.1f}s...")
+                time.sleep(delay)
+                continue
             raise
+
+
+def retry_settings(args: argparse.Namespace) -> dict[str, Any]:
+    """Per-run transient-retry knobs, as kwargs for :func:`call_with_retry`."""
+    return {
+        "retries": max(0, int(getattr(args, "network_retries", NETWORK_RETRIES))),
+        "backoff": max(0.0, float(getattr(args, "network_backoff_seconds", NETWORK_BACKOFF_SECONDS))),
+    }
+
+
+def delete_dedup_keys(client: "Client", dedup_keys: list[str], *, refresher, label: str, retry: dict[str, Any]) -> None:
+    """Trash then permanently delete ``dedup_keys``, retrying transient failures.
+
+    Both calls are idempotent for our purposes (re-trashing an already-trashed item
+    is a no-op), so retrying them is safe.
+    """
+    call_with_retry(
+        lambda: client.api.move_remote_media_to_trash(dedup_keys),
+        on_auth_error=refresher, label=f"trash ({label})", **retry,
+    )
+    call_with_retry(
+        lambda: client.api.delete_remote_media_permanently(dedup_keys),
+        on_auth_error=refresher, label=f"permanent delete ({label})", **retry,
+    )
 
 
 def build_auth_refresher(client, args):
@@ -409,13 +497,26 @@ def get_download_urls(download_response: dict[str, Any]) -> tuple[str | None, st
     return original, edited, discovered
 
 
-def download_file(url: str, destination: Path, timeout: int, retries: int) -> None:
+def download_file(
+    url: str,
+    destination: Path,
+    timeout: int,
+    retries: int,
+    backoff: float = NETWORK_BACKOFF_SECONDS,
+) -> None:
+    """Stream ``url`` to ``destination``, retrying transient failures.
+
+    Each attempt writes to a ``.part`` file that is discarded on failure, so a
+    connection dropped mid-body never leaves a truncated original behind. A hard
+    rejection (an expired or malformed URL: 4xx other than 408/429) fails fast --
+    only blips and connectivity errors are worth waiting on.
+    """
     import requests
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path = destination.with_suffix(destination.suffix + ".part")
 
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, max(1, retries) + 1):
         try:
             with requests.get(url, stream=True, timeout=timeout) as response:
                 response.raise_for_status()
@@ -425,12 +526,14 @@ def download_file(url: str, destination: Path, timeout: int, retries: int) -> No
                             fh.write(chunk)
             temp_path.replace(destination)
             return
-        except Exception:
-            if temp_path.exists():
-                temp_path.unlink()
-            if attempt == retries:
+        except Exception as exc:
+            with contextlib.suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+            if attempt == retries or not is_transient_error(exc):
                 raise
-            time.sleep(min(2 * attempt, 10))
+            delay = retry_delay(attempt, backoff)
+            print(f"   ↻ Download failed ({attempt}/{retries}): {exc}. Retrying in {delay:.1f}s...")
+            time.sleep(delay)
 
 
 def init_manifest(manifest_path: Path, work_dir: Path, db_path: Path) -> dict[str, Any]:
@@ -447,10 +550,11 @@ def init_manifest(manifest_path: Path, work_dir: Path, db_path: Path) -> dict[st
 
 def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     refresher = build_auth_refresher(client, args)
+    retry = retry_settings(args)
     print("[1/2] Updating local cache...")
-    call_with_auth_retry(
+    call_with_retry(
         lambda: client.update_cache(show_progress=args.progress),
-        on_auth_error=refresher, label="cache update",
+        on_auth_error=refresher, label="cache update", **retry,
     )
 
     print("[1/2] Loading quota-charged items from cache...")
@@ -487,9 +591,9 @@ def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
 
         try:
             print(f"[1/2] ({index}/{len(items)}) Preparing download for {media_key}...")
-            urls_response = call_with_auth_retry(
+            urls_response = call_with_retry(
                 lambda: client.api.get_download_urls(media_key),
-                on_auth_error=refresher, label=f"download-URL fetch ({media_key})",
+                on_auth_error=refresher, label=f"download-URL fetch ({media_key})", **retry,
             )
             original_url, edited_url, discovered_urls = get_download_urls(urls_response)
             selected_url = original_url or edited_url or (discovered_urls[0] if discovered_urls else None)
@@ -503,7 +607,13 @@ def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
             if local_path.exists() and args.skip_existing:
                 print(f"[1/2] ({index}/{len(items)}) Skipping existing file {local_path.name}")
             else:
-                download_file(selected_url, local_path, timeout=args.download_timeout, retries=args.download_retries)
+                download_file(
+                    selected_url,
+                    local_path,
+                    timeout=args.download_timeout,
+                    retries=args.download_retries,
+                    backoff=retry["backoff"],
+                )
 
             timestamp = (
                 to_epoch_seconds(item.get("utc_timestamp"))
@@ -531,6 +641,9 @@ def download_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
             print(f"[1/2] ({index}/{len(items)}) Download failed for {media_key}: {exc}")
 
         manifest["items"].append(entry)
+        # Flush periodically: a run that dies at item 9000 must not lose 8999 downloads.
+        if index % MANIFEST_FLUSH_INTERVAL == 0:
+            write_json(manifest_path, manifest)
 
     write_json(manifest_path, manifest)
     print(f"[1/2] Download phase complete. Success: {len(items) - failures}, Failed: {failures}")
@@ -552,6 +665,7 @@ def restore_metadata(client: "Client", dedup_key: str, entry: dict[str, Any]) ->
 
 def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     refresher = build_auth_refresher(client, args)
+    retry = retry_settings(args)
     manifest_path = args.manifest.resolve()
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest does not exist: {manifest_path}")
@@ -562,19 +676,17 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
         print("[2/2] No downloadable items in manifest. Nothing to upload.")
         return manifest, 0
 
+    # An empty queue is not an early exit: metadata restore and --delete-originals may
+    # still have work left from an interrupted run, and both are resumable.
     pending_entries = [item for item in entries if item.get("upload_status") != "ok"]
     if not pending_entries:
-        print("[2/2] All downloadable items are already marked as uploaded.")
-        manifest["failed_upload_queue"] = []
-        manifest["failed_upload_count"] = 0
-        manifest["last_reupload_run_at"] = utc_now_iso()
-        write_json(manifest_path, manifest)
-        return manifest, 0
+        print("[2/2] All downloadable items are already marked as uploaded; skipping upload rounds.")
 
     max_attempts = max(1, int(args.upload_max_attempts))
     retry_backoff_seconds = max(0, int(args.retry_backoff_seconds))
 
     upload_failures = 0
+    delete_failures = 0
     delete_before_upload = not args.keep_original_before_upload
     queue = list(pending_entries)
     for attempt in range(1, max_attempts + 1):
@@ -602,8 +714,13 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
                     old_dedup_key = entry.get("dedup_key")
                     if old_dedup_key:
                         try:
-                            client.api.move_remote_media_to_trash([old_dedup_key])
-                            client.api.delete_remote_media_permanently([old_dedup_key])
+                            delete_dedup_keys(
+                                client,
+                                [old_dedup_key],
+                                refresher=refresher,
+                                label=f"pre-upload {entry.get('media_key')}",
+                                retry=retry,
+                            )
                             entry["old_media_deleted_before_upload"] = True
                             entry["old_media_deleted_before_upload_at"] = utc_now_iso()
                         except Exception as delete_exc:
@@ -623,7 +740,7 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
                 }
 
                 print(f"[2/2] ({index}/{len(queue)}) Uploading {media_path.name}...")
-                upload_result = call_with_auth_retry(
+                upload_result = call_with_retry(
                     lambda: client.upload(
                         target=target,
                         use_quota=False,
@@ -632,7 +749,7 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
                         threads=1,
                         force_upload=not args.no_force_upload,
                     ),
-                    on_auth_error=refresher, label=f"upload ({media_path.name})",
+                    on_auth_error=refresher, label=f"upload ({media_path.name})", **retry,
                 )
                 new_media_key = next(iter(upload_result.values()))
 
@@ -650,6 +767,11 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
 
                 if attempt < max_attempts and is_retryable_upload_error(str(exc)):
                     next_queue.append(entry)
+
+            # Flush mid-round: a crash must not lose the record of what was already
+            # uploaded (and whose original was already deleted).
+            if index % MANIFEST_FLUSH_INTERVAL == 0:
+                write_json(manifest_path, manifest)
 
         queue = next_queue
         manifest["failed_upload_queue"] = [entry.get("media_key") for entry in queue if entry.get("media_key")]
@@ -677,15 +799,23 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
         print("[2/2] Failed upload queue retained: 0 item(s).")
 
     if not args.no_restore_metadata:
-        uploaded_entries = [item for item in entries if item.get("upload_status") == "ok" and item.get("new_media_key")]
+        uploaded_entries = [
+            item
+            for item in entries
+            if item.get("upload_status") == "ok"
+            and item.get("new_media_key")
+            and item.get("metadata_restore_status") != "ok"
+        ]
         if uploaded_entries:
             print("[2/2] Refreshing cache to resolve new dedup keys for metadata restoration...")
-            call_with_auth_retry(
+            call_with_retry(
                 lambda: client.update_cache(show_progress=args.progress),
-                on_auth_error=refresher, label="cache refresh",
+                on_auth_error=refresher, label="cache refresh", **retry,
             )
             dedup_map = query_dedup_keys(client.db_path, [item["new_media_key"] for item in uploaded_entries])
-            for entry in uploaded_entries:
+            for restored, entry in enumerate(uploaded_entries, start=1):
+                if restored % MANIFEST_FLUSH_INTERVAL == 0:
+                    write_json(manifest_path, manifest)
                 new_media_key = entry["new_media_key"]
                 dedup_key = dedup_map.get(new_media_key)
                 if not dedup_key:
@@ -694,9 +824,9 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
                     continue
 
                 try:
-                    call_with_auth_retry(
+                    call_with_retry(
                         lambda: restore_metadata(client, dedup_key, entry),
-                        on_auth_error=refresher, label=f"metadata restore ({new_media_key})",
+                        on_auth_error=refresher, label=f"metadata restore ({new_media_key})", **retry,
                     )
                     entry["metadata_restore_status"] = "ok"
                     entry["metadata_restored_at"] = utc_now_iso()
@@ -714,6 +844,8 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
             and item.get("new_media_key")
             and item.get("new_media_key") != item.get("media_key")
             and item.get("dedup_key")
+            and not item.get("old_media_deleted")
+            and not item.get("old_media_deleted_before_upload")
         ]
 
         dedup_to_entries: dict[str, list[dict[str, Any]]] = {}
@@ -721,21 +853,64 @@ def reupload_phase(client: "Client", args: argparse.Namespace) -> tuple[dict[str
             dedup_key = str(entry["dedup_key"])
             dedup_to_entries.setdefault(dedup_key, []).append(entry)
 
+        def mark_deleted(keys: list[str]) -> None:
+            stamp = utc_now_iso()
+            for dedup_key in keys:
+                for entry in dedup_to_entries[dedup_key]:
+                    entry["old_media_deleted"] = True
+                    entry["old_media_deleted_at"] = stamp
+                    entry.pop("old_media_delete_error", None)
+
+        def mark_delete_failed(keys: list[str], error: BaseException) -> None:
+            for dedup_key in keys:
+                for entry in dedup_to_entries[dedup_key]:
+                    entry["old_media_deleted"] = False
+                    entry["old_media_delete_error"] = str(error)
+
         dedup_keys = list(dedup_to_entries.keys())
         if dedup_keys:
             print(f"[2/2] Deleting {len(dedup_keys)} original quota-charged items...")
-            for batch in chunked(dedup_keys, 500):
-                client.api.move_remote_media_to_trash(batch)
-                client.api.delete_remote_media_permanently(batch)
+            for batch_index, batch in enumerate(chunked(dedup_keys, 500), start=1):
+                try:
+                    delete_dedup_keys(
+                        client, batch, refresher=refresher, label=f"originals batch {batch_index}", retry=retry
+                    )
+                    mark_deleted(batch)
+                    write_json(manifest_path, manifest)
+                    continue
+                except Exception as exc:  # noqa: BLE001 - a stuck batch must not abort the run
+                    print(f"[2/2] Batch delete failed for {len(batch)} item(s): {exc}")
+                    if len(batch) == 1:
+                        mark_delete_failed(batch, exc)
+                        delete_failures += 1
+                        write_json(manifest_path, manifest)
+                        continue
+                    # One rejected key would strand the whole batch, so retry key by key.
+                    print("[2/2] Falling back to one-by-one deletion for this batch...")
+
                 for dedup_key in batch:
-                    for entry in dedup_to_entries[dedup_key]:
-                        entry["old_media_deleted"] = True
-                        entry["old_media_deleted_at"] = utc_now_iso()
+                    try:
+                        delete_dedup_keys(
+                            client, [dedup_key], refresher=refresher, label=f"original {dedup_key}", retry=retry
+                        )
+                        mark_deleted([dedup_key])
+                    except Exception as exc:  # noqa: BLE001 - recorded in the manifest, run continues
+                        delete_failures += 1
+                        mark_delete_failed([dedup_key], exc)
+                        print(f"[2/2] Delete failed for {dedup_key}: {exc}")
+                write_json(manifest_path, manifest)
+
+            manifest["failed_original_delete_count"] = delete_failures
             write_json(manifest_path, manifest)
+            if delete_failures:
+                print(
+                    f"[2/2] {delete_failures} original item(s) could not be deleted; "
+                    "see manifest.items[].old_media_delete_error. Re-run with --delete-originals to retry them."
+                )
 
     print(f"[2/2] Re-upload phase complete. Success: {len(entries) - upload_failures}, Failed: {upload_failures}")
     print(f"[2/2] Manifest updated at: {manifest_path}")
-    return manifest, upload_failures
+    return manifest, upload_failures + delete_failures
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -793,7 +968,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None, help="Optional cap on number of quota-charged items to process.")
     parser.add_argument("--skip-existing", action="store_true", help="Skip downloading files that already exist in work-dir/files.")
     parser.add_argument("--download-timeout", type=int, default=120, help="Direct media download timeout in seconds.")
-    parser.add_argument("--download-retries", type=int, default=3, help="Retries for media file downloads.")
+    parser.add_argument("--download-retries", type=int, default=5, help="Retries for media file downloads.")
+    parser.add_argument(
+        "--network-retries",
+        type=int,
+        default=NETWORK_RETRIES,
+        help=f"Retries per API call for transient failures (5xx/429/timeouts/connection drops). Default {NETWORK_RETRIES}; 0 disables.",
+    )
+    parser.add_argument(
+        "--network-backoff-seconds",
+        type=float,
+        default=NETWORK_BACKOFF_SECONDS,
+        help=f"Base backoff between transient retries; doubles per attempt with jitter, capped at "
+        f"{NETWORK_BACKOFF_CAP_SECONDS:.0f}s (default {NETWORK_BACKOFF_SECONDS:g}).",
+    )
 
     parser.add_argument("--download-only", action="store_true", help="Run only phase 1 (download + metadata export).")
     parser.add_argument("--reupload-only", action="store_true", help="Run only phase 2 (re-upload using existing manifest).")
