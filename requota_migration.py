@@ -238,7 +238,8 @@ _RESERVED_NAMES = {
 MAX_KEY_LENGTH = 64
 MAX_NAME_LENGTH = 150
 
-# 1980-01-01: the oldest timestamp Windows will store on a file.
+# 1980-01-01: the oldest timestamp a FAT/exFAT volume can store. NTFS (and every
+# Linux filesystem) goes back much further, so this is only a fallback.
 MIN_FILE_TIMESTAMP = 315_532_800
 # Above this, a value cannot be seconds (it would be past year 5138), so it is
 # the millisecond form the cache actually stores.
@@ -353,18 +354,34 @@ def to_epoch_seconds(value: Any) -> int | None:
 
 
 def set_file_mtime(path: Path, timestamp: int | None) -> None:
-    """Stamp ``path`` with ``timestamp``; warn rather than fail the item."""
+    """Stamp ``path`` with ``timestamp``; warn rather than fail the item.
+
+    gpmc uploads the mtime as the item's date, so the exact value is tried first:
+    NTFS stores dates back to 1601. Only if the volume refuses it (FAT/exFAT stop
+    at 1980) is a pre-1980 date clamped to the oldest one it can hold.
+    """
     if timestamp is None:
         return
-    if IS_WINDOWS and timestamp < MIN_FILE_TIMESTAMP:
-        timestamp = MIN_FILE_TIMESTAMP
     try:
-        if os.utime in os.supports_follow_symlinks:
-            os.utime(path, (timestamp, timestamp), follow_symlinks=False)
-        else:  # Windows only exposes the symlink-following form
-            os.utime(path, (timestamp, timestamp))
-    except (OSError, ValueError, NotImplementedError) as exc:
-        print(f"    ! Could not set mtime on {path.name}: {exc}")
+        _utime(path, timestamp)
+        return
+    except (OSError, ValueError, OverflowError, NotImplementedError) as exc:
+        error = exc
+    if timestamp < MIN_FILE_TIMESTAMP:
+        try:
+            _utime(path, MIN_FILE_TIMESTAMP)
+            print(f"    ! {path.name}: volume cannot store dates before 1980; clamped to 1980-01-01.")
+            return
+        except (OSError, ValueError, OverflowError, NotImplementedError) as exc:
+            error = exc
+    print(f"    ! Could not set mtime on {path.name}: {error}")
+
+
+def _utime(path: Path, timestamp: int) -> None:
+    if os.utime in os.supports_follow_symlinks:
+        os.utime(path, (timestamp, timestamp), follow_symlinks=False)
+    else:  # Windows only exposes the symlink-following form
+        os.utime(path, (timestamp, timestamp))
 
 
 def normalize_caption(value: Any) -> str:

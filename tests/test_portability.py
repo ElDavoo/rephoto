@@ -10,6 +10,7 @@ import mimetypes
 import os
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -94,15 +95,26 @@ class SetFileMtimeTests(unittest.TestCase):
             r.set_file_mtime(path, None)
             self.assertEqual(path.stat().st_mtime, before)
 
-    def test_pre_1980_is_clamped_on_windows(self):
+    def test_pre_1980_dates_are_kept(self):
+        # NTFS stores these fine; clamping would redate old photos on upload.
         with TemporaryDirectory() as d:
             path = self._file(d)
-            original = r.IS_WINDOWS
-            r.IS_WINDOWS = True
-            try:
+            for ts in (1000, -631152000):
+                r.set_file_mtime(path, ts)
+                self.assertEqual(int(path.stat().st_mtime), ts)
+
+    def test_pre_1980_is_clamped_only_when_the_volume_refuses_it(self):
+        real_utime = os.utime
+
+        def fat_utime(path, times, **kwargs):
+            if times[0] < r.MIN_FILE_TIMESTAMP:
+                raise OSError(22, "Invalid argument")
+            real_utime(path, times, **kwargs)
+
+        with TemporaryDirectory() as d:
+            path = self._file(d)
+            with mock.patch.object(r.os, "utime", fat_utime):
                 r.set_file_mtime(path, 1000)
-            finally:
-                r.IS_WINDOWS = original
             self.assertEqual(int(path.stat().st_mtime), r.MIN_FILE_TIMESTAMP)
 
     def test_failure_is_reported_not_raised(self):
