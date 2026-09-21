@@ -27,6 +27,7 @@ from __future__ import annotations
 import getpass
 import json
 import os
+import platform
 import secrets
 import subprocess
 import sys
@@ -169,6 +170,32 @@ def minimal_auth_data(email: str, lang: str = "en") -> str:
     return f"Email={quote(email)}&lang={lang}"
 
 
+def windows_account_principal() -> str:
+    """The current Windows account as an unambiguous ``icacls`` principal.
+
+    A bare username is ambiguous: ``icacls`` resolves ``Claudio`` against the
+    machine/domain name first, so on a PC *named* after its user the grant lands
+    on the computer account instead. The SID (``*S-1-5-…``) names exactly this
+    account; ``DOMAIN\\user`` is the fallback if ``whoami`` is unavailable.
+    """
+    try:
+        proc = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        sid = proc.stdout.strip().rsplit(",", 1)[-1].strip().strip('"')
+        if proc.returncode == 0 and sid.startswith("S-1-"):
+            return f"*{sid}"
+    except Exception:  # noqa: BLE001 - fall back to the qualified name
+        pass
+    user = os.environ.get("USERNAME") or getpass.getuser()
+    domain = os.environ.get("USERDOMAIN") or platform.node()
+    return f"{domain}\\{user}" if domain else user
+
+
 def restrict_to_owner(path: Path) -> None:
     """Make ``path`` readable by its owner only.
 
@@ -181,9 +208,9 @@ def restrict_to_owner(path: Path) -> None:
         os.chmod(path, 0o600)
         return
     try:
-        user = os.environ.get("USERNAME") or getpass.getuser()
+        principal = windows_account_principal()
         proc = subprocess.run(
-            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{principal}:F"],
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -216,7 +243,12 @@ def save_credentials(
         "client_sig": client_sig or PHOTOS_CLIENT_SIG,
     }
     # Create the file private from the start, then restrict it explicitly (a
-    # pre-existing file opened with O_TRUNC keeps its old permissions).
+    # pre-existing file opened with O_TRUNC keeps its old permissions). On Windows
+    # an existing file may carry an ACL that locks us out (older versions granted
+    # the wrong principal); as its owner we can still rewrite the ACL, so do that
+    # first or the open below fails with PermissionError.
+    if os.name == "nt" and path.exists():
+        restrict_to_owner(path)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)

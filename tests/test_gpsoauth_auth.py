@@ -12,6 +12,7 @@ import sys
 import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -252,6 +253,33 @@ class LoadGpsoauthErrorTests(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertIn("failed to import", msg)
         self.assertIn("pycryptodomex", msg)
+
+
+class WindowsPrincipalTests(unittest.TestCase):
+    """icacls must get an unambiguous principal, not a bare username (a PC named
+    like its user makes ``Claudio`` resolve to the computer account)."""
+
+    def _run(self, stdout=None, returncode=0, raises=None):
+        def fake_run(*args, **kwargs):
+            if raises:
+                raise raises
+            return types.SimpleNamespace(stdout=stdout, stderr="", returncode=returncode)
+
+        orig = g.subprocess.run
+        g.subprocess.run = fake_run
+        try:
+            with mock.patch.dict(os.environ, {"USERDOMAIN": "CLAUDIO", "USERNAME": "Claudio"}):
+                return g.windows_account_principal()
+        finally:
+            g.subprocess.run = orig
+
+    def test_uses_sid_from_whoami(self):
+        out = '"claudio\\claudio","S-1-5-21-1-2-3-1001"\r\n'
+        self.assertEqual(self._run(out), "*S-1-5-21-1-2-3-1001")
+
+    def test_falls_back_to_domain_qualified_name(self):
+        self.assertEqual(self._run(raises=FileNotFoundError()), "CLAUDIO\\Claudio")
+        self.assertEqual(self._run("garbage", returncode=1), "CLAUDIO\\Claudio")
 
 
 if __name__ == "__main__":
